@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aw-core",
+    "crates/aw-scheduler",
+    "crates/aw-fsevents",
+    "crates/aw-process",
+    "crates/aw-network",
+    "crates/aw-window",
+    "crates/aw-system",
+    "crates/aw-eslogger",
+    "crates/aw-events",
+    "crates/aw-events-cli",
+    "crates/aw-observe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aw-core = { path = "crates/aw-core" }
+aw-scheduler = { path = "crates/aw-scheduler" }
+aw-fsevents = { path = "crates/aw-fsevents" }
+aw-process = { path = "crates/aw-process" }
+aw-network = { path = "crates/aw-network" }
+aw-window = { path = "crates/aw-window" }
+aw-system = { path = "crates/aw-system" }
+aw-eslogger = { path = "crates/aw-eslogger" }
+aw-events = { path = "crates/aw-events" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"

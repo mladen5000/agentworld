@@ -1,0 +1,28 @@
+[package]
+name = "aw-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wires Layer 1 adapters into a unified NDJSON observation stream."
+
+[[bin]]
+name = "aw-observe"
+path = "src/main.rs"
+
+[dependencies]
+aw-core = { workspace = true }
+aw-scheduler = { workspace = true }
+aw-fsevents = { workspace = true }
+aw-process = { workspace = true }
+aw-network = { workspace = true }
+aw-window = { workspace = true }
+aw-system = { workspace = true }
+aw-eslogger = { workspace = true }
+aw-events = { workspace = true }
+
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

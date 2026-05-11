@@ -1,0 +1,19 @@
+[package]
+name = "aw-events-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reads NDJSON observations from stdin, emits canonical events on stdout."
+
+[[bin]]
+name = "aw-events"
+path = "src/main.rs"
+
+[dependencies]
+aw-core = { workspace = true }
+aw-events = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

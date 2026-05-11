@@ -1,0 +1,12 @@
+[package]
+name = "aw-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 1 ingestion scheduler (stream / snapshot / diff dispatch)."
+
+[dependencies]
+aw-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
