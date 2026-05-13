@@ -95,6 +95,25 @@ Same fields as `connection_opened`, plus:
 
 **Sampling caveat**: short-lived connections (sub-second `curl` requests) may never appear in any snapshot tick and thus produce no opened/closed events.
 
+## connection_completed
+
+Synthetic per-connection summary. Emitted **alongside** `connection_closed` at the tick boundary that detects the disappearance — one summary event per real connection. Use this when you want a single record per network conversation; use `connection_opened`/`connection_closed` when you need the raw lifecycle pair.
+
+| field | type | notes |
+|---|---|---|
+| `pid` (top-level) | `u32?` | owning process pid (carried from the last observation) |
+| `proto`, `local_addr`, `foreign_addr` | `string` | same identity tuple as opened/closed |
+| `final_state` | `string?` | last observed state (e.g. `ESTABLISHED`, `TIME_WAIT`); `null` for UDP |
+| `process_name` | `string?` | last-observed netstat process name |
+| `bytes_rx` | `u64?` | cumulative bytes received (final value reported by netstat) |
+| `bytes_tx` | `u64?` | cumulative bytes transmitted |
+| `opened_at` | `Timestamp` | mono_ns of the first observation of this tuple |
+| `closed_at` | `Timestamp` | mono_ns of the last observation |
+| `duration_ns` | `u64` | `closed_at.mono_ns - opened_at.mono_ns`; bounded above by the poll interval |
+| `process` *(enriched)* | object? | see [Process enrichment](#process-enrichment) below |
+
+**Accuracy note**: `opened_at` reflects when the *adapter* first saw the tuple, not when the kernel created the socket. For long-lived connections this is close; for short-lived ones it may be hundreds of milliseconds late or missed entirely.
+
 ---
 
 ## file_changed

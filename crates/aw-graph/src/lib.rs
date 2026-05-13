@@ -92,9 +92,19 @@ pub struct Interval {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Edge {
-    ParentOf { parent: ProcessId, child: ProcessId },
-    FrontmostDuring { app: String, process: ProcessId, overlap: Interval },
-    OpenedSocket { process: ProcessId, socket: SocketId },
+    ParentOf {
+        parent: ProcessId,
+        child: ProcessId,
+    },
+    FrontmostDuring {
+        app: String,
+        process: ProcessId,
+        overlap: Interval,
+    },
+    OpenedSocket {
+        process: ProcessId,
+        socket: SocketId,
+    },
 }
 
 /// The materialized graph. Nodes and edges, both serializable.
@@ -145,9 +155,11 @@ impl GraphBuilder {
             EventKind::ConnectionClosed => self.on_connection_closed(ev),
             EventKind::FileChanged => self.on_file_changed(ev),
             // DNS queries are not yet folded into the graph (no DomainName
-            // node type yet). They still advance `last_ts` above so interval
-            // closure remains correct.
-            EventKind::DnsQuery => {}
+            // node type yet). `ConnectionCompleted` is a derived synthesis
+            // of data already captured by Opened+Closed, so the graph does
+            // not double-consume it. They still advance `last_ts` above so
+            // interval closure remains correct.
+            EventKind::DnsQuery | EventKind::ConnectionCompleted => {}
         }
     }
 
@@ -159,15 +171,26 @@ impl GraphBuilder {
     }
 
     fn on_process_birth(&mut self, ev: &Event) {
-        let Some(id) = process_id_from_event(ev) else { return; };
+        let Some(id) = process_id_from_event(ev) else {
+            return;
+        };
         let p = &ev.payload;
         let node = ProcessNode {
             id: id.clone(),
             comm: p.get("comm").and_then(|v| v.as_str()).map(String::from),
             name: p.get("name").and_then(|v| v.as_str()).map(String::from),
-            exec_path: p.get("exec_path").and_then(|v| v.as_str()).map(String::from),
-            ppid: p.get("ppid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
-            uid: p.get("uid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
+            exec_path: p
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            ppid: p
+                .get("ppid")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok()),
+            uid: p
+                .get("uid")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok()),
             birth: ev.timestamp,
             death: None,
         };
@@ -175,7 +198,9 @@ impl GraphBuilder {
     }
 
     fn on_process_death(&mut self, ev: &Event) {
-        let Some(id) = process_id_from_event(ev) else { return; };
+        let Some(id) = process_id_from_event(ev) else {
+            return;
+        };
         if let Some(node) = self.processes.get_mut(&id) {
             node.death = Some(ev.timestamp);
         } else {
@@ -187,9 +212,18 @@ impl GraphBuilder {
                 id: id.clone(),
                 comm: p.get("comm").and_then(|v| v.as_str()).map(String::from),
                 name: p.get("name").and_then(|v| v.as_str()).map(String::from),
-                exec_path: p.get("exec_path").and_then(|v| v.as_str()).map(String::from),
-                ppid: p.get("ppid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
-                uid: p.get("uid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
+                exec_path: p
+                    .get("exec_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                ppid: p
+                    .get("ppid")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                uid: p
+                    .get("uid")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
                 birth: ev.timestamp,
                 death: Some(ev.timestamp),
             };
@@ -207,7 +241,10 @@ impl GraphBuilder {
             },
         };
         let name = p.get("to_name").and_then(|v| v.as_str()).map(String::from);
-        let exec_path = p.get("to_exec_path").and_then(|v| v.as_str()).map(String::from);
+        let exec_path = p
+            .get("to_exec_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Close the prior frontmost's interval at `ev.timestamp`.
         if let Some((prev_id, prev_from)) = self.current_frontmost.take() {
@@ -221,7 +258,10 @@ impl GraphBuilder {
             // Defensive: if upstream let a no-op through, keep folding.
             if prev_id == id {
                 if let Some(app) = self.apps.get_mut(&prev_id) {
-                    app.intervals.push(Interval { from: prev_from, to: None });
+                    app.intervals.push(Interval {
+                        from: prev_from,
+                        to: None,
+                    });
                 }
                 self.current_frontmost = Some((id, prev_from));
                 return;
@@ -234,19 +274,31 @@ impl GraphBuilder {
             exec_path: exec_path.clone(),
             intervals: Vec::new(),
         });
-        if app.name.is_none() { app.name = name; }
-        if app.exec_path.is_none() { app.exec_path = exec_path; }
-        app.intervals.push(Interval { from: ev.timestamp, to: None });
+        if app.name.is_none() {
+            app.name = name;
+        }
+        if app.exec_path.is_none() {
+            app.exec_path = exec_path;
+        }
+        app.intervals.push(Interval {
+            from: ev.timestamp,
+            to: None,
+        });
         self.current_frontmost = Some((id, ev.timestamp));
     }
 
     fn on_connection_opened(&mut self, ev: &Event) {
-        let Some(id) = socket_id_from_event(ev) else { return; };
+        let Some(id) = socket_id_from_event(ev) else {
+            return;
+        };
         let p = &ev.payload;
         let node = SocketNode {
             id: id.clone(),
             state: p.get("state").and_then(|v| v.as_str()).map(String::from),
-            process_name: p.get("process_name").and_then(|v| v.as_str()).map(String::from),
+            process_name: p
+                .get("process_name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             pid_at_open: ev.pid,
             opened: ev.timestamp,
             closed: None,
@@ -257,7 +309,9 @@ impl GraphBuilder {
     }
 
     fn on_connection_closed(&mut self, ev: &Event) {
-        let Some(id) = socket_id_from_event(ev) else { return; };
+        let Some(id) = socket_id_from_event(ev) else {
+            return;
+        };
         if let Some(node) = self.sockets.get_mut(&id) {
             node.closed = Some(ev.timestamp);
             let p = &ev.payload;
@@ -275,7 +329,10 @@ impl GraphBuilder {
             let node = SocketNode {
                 id: id.clone(),
                 state: p.get("state").and_then(|v| v.as_str()).map(String::from),
-                process_name: p.get("process_name").and_then(|v| v.as_str()).map(String::from),
+                process_name: p
+                    .get("process_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 pid_at_open: ev.pid,
                 opened: ev.timestamp,
                 closed: Some(ev.timestamp),
@@ -288,20 +345,30 @@ impl GraphBuilder {
 
     fn on_file_changed(&mut self, ev: &Event) {
         let p = &ev.payload;
-        let Some(path) = p.get("path").and_then(|v| v.as_str()) else { return; };
-        let new_flags: Vec<String> = p.get("flags")
+        let Some(path) = p.get("path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let new_flags: Vec<String> = p
+            .get("flags")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let count = p.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        let entry = self.files.entry(path.to_string()).or_insert_with(|| FileNode {
-            path: path.to_string(),
-            flags: Vec::new(),
-            first_seen: ev.timestamp,
-            last_seen: ev.timestamp,
-            touch_count: 0,
-        });
+        let entry = self
+            .files
+            .entry(path.to_string())
+            .or_insert_with(|| FileNode {
+                path: path.to_string(),
+                flags: Vec::new(),
+                first_seen: ev.timestamp,
+                last_seen: ev.timestamp,
+                touch_count: 0,
+            });
         entry.last_seen = ev.timestamp;
         entry.touch_count += count;
         for f in new_flags {
@@ -337,7 +404,9 @@ impl GraphBuilder {
         // parent_of edges
         let by_pid: HashMap<u32, &ProcessNode> = processes.iter().map(|p| (p.id.pid, p)).collect();
         for child in &processes {
-            let Some(ppid) = child.ppid else { continue; };
+            let Some(ppid) = child.ppid else {
+                continue;
+            };
             if let Some(parent) = by_pid.get(&ppid) {
                 // Same pid table snapshot, so this is a *current* ppid match.
                 // The parent must have been born by the child's birth time.
@@ -353,9 +422,15 @@ impl GraphBuilder {
         // frontmost_during edges
         for app in &apps {
             for interval in &app.intervals {
-                let interval_to = interval.to.unwrap_or(Timestamp { mono_ns: u64::MAX, wall_anchor_ns: 0 });
+                let interval_to = interval.to.unwrap_or(Timestamp {
+                    mono_ns: u64::MAX,
+                    wall_anchor_ns: 0,
+                });
                 for proc in &processes {
-                    let proc_to = proc.death.unwrap_or(Timestamp { mono_ns: u64::MAX, wall_anchor_ns: 0 });
+                    let proc_to = proc.death.unwrap_or(Timestamp {
+                        mono_ns: u64::MAX,
+                        wall_anchor_ns: 0,
+                    });
                     let overlap_from = max_ts(interval.from, proc.birth);
                     let overlap_to = min_ts(interval_to, proc_to);
                     if overlap_from.mono_ns < overlap_to.mono_ns {
@@ -364,7 +439,11 @@ impl GraphBuilder {
                             process: proc.id.clone(),
                             overlap: Interval {
                                 from: overlap_from,
-                                to: if overlap_to.mono_ns == u64::MAX { None } else { Some(overlap_to) },
+                                to: if overlap_to.mono_ns == u64::MAX {
+                                    None
+                                } else {
+                                    Some(overlap_to)
+                                },
                             },
                         });
                     }
@@ -378,11 +457,15 @@ impl GraphBuilder {
         // If multiple processes share the pid (reused after death), tie-break
         // by the one alive at `opened`.
         for socket in &sockets {
-            let Some(pid) = socket.pid_at_open else { continue; };
+            let Some(pid) = socket.pid_at_open else {
+                continue;
+            };
             let candidates = processes.iter().filter(|p| {
                 p.id.pid == pid
                     && p.birth.mono_ns <= socket.opened.mono_ns
-                    && p.death.map(|d| d.mono_ns >= socket.opened.mono_ns).unwrap_or(true)
+                    && p.death
+                        .map(|d| d.mono_ns >= socket.opened.mono_ns)
+                        .unwrap_or(true)
             });
             // Take the most-recently-born candidate (most likely the right one
             // under pid reuse).
@@ -394,18 +477,29 @@ impl GraphBuilder {
             }
         }
 
-        Graph { processes, apps, sockets, files, edges }
+        Graph {
+            processes,
+            apps,
+            sockets,
+            files,
+            edges,
+        }
     }
 }
 
 impl Default for GraphBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn process_id_from_event(ev: &Event) -> Option<ProcessId> {
     let pid = ev.pid?;
     let start = ev.payload.get("start_unix_secs")?.as_u64()?;
-    Some(ProcessId { pid, start_unix_secs: start })
+    Some(ProcessId {
+        pid,
+        start_unix_secs: start,
+    })
 }
 
 fn socket_id_from_event(ev: &Event) -> Option<SocketId> {
@@ -413,15 +507,27 @@ fn socket_id_from_event(ev: &Event) -> Option<SocketId> {
     let proto = p.get("proto")?.as_str()?.to_string();
     let local_addr = p.get("local_addr")?.as_str()?.to_string();
     let foreign_addr = p.get("foreign_addr")?.as_str()?.to_string();
-    Some(SocketId { proto, local_addr, foreign_addr })
+    Some(SocketId {
+        proto,
+        local_addr,
+        foreign_addr,
+    })
 }
 
 fn min_ts(a: Timestamp, b: Timestamp) -> Timestamp {
-    if a.mono_ns <= b.mono_ns { a } else { b }
+    if a.mono_ns <= b.mono_ns {
+        a
+    } else {
+        b
+    }
 }
 
 fn max_ts(a: Timestamp, b: Timestamp) -> Timestamp {
-    if a.mono_ns >= b.mono_ns { a } else { b }
+    if a.mono_ns >= b.mono_ns {
+        a
+    } else {
+        b
+    }
 }
 
 #[cfg(test)]
@@ -429,7 +535,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
     fn birth(pid: u32, start: u64, comm: &str, ppid: u32, mono: u64) -> Event {
         Event {
@@ -530,7 +641,11 @@ mod tests {
         b.on_event(&birth(100, 1000, "parent", 1, 10));
         b.on_event(&birth(200, 1001, "child", 100, 11)); // ppid = 100
         let g = b.build();
-        let parent_edges: Vec<_> = g.edges.iter().filter(|e| matches!(e, Edge::ParentOf { .. })).collect();
+        let parent_edges: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| matches!(e, Edge::ParentOf { .. }))
+            .collect();
         assert_eq!(parent_edges.len(), 1);
         match parent_edges[0] {
             Edge::ParentOf { parent, child } => {
@@ -571,10 +686,19 @@ mod tests {
         b.on_event(&death(100, 1000, 25));
         b.on_event(&focus("com.app.b", "AppB", 30));
         let g = b.build();
-        let fronts: Vec<_> = g.edges.iter().filter(|e| matches!(e, Edge::FrontmostDuring { .. })).collect();
+        let fronts: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| matches!(e, Edge::FrontmostDuring { .. }))
+            .collect();
         // AppA overlaps with process p. AppB starts after p died, so no overlap.
         assert_eq!(fronts.len(), 1);
-        if let Edge::FrontmostDuring { app, process, overlap } = fronts[0] {
+        if let Edge::FrontmostDuring {
+            app,
+            process,
+            overlap,
+        } = fronts[0]
+        {
             assert_eq!(app, "com.app.a");
             assert_eq!(process.pid, 100);
             assert_eq!(overlap.from, ts(15));
@@ -621,7 +745,9 @@ mod tests {
         b.on_event(&birth(100, 1000, "curl", 1, 10));
         b.on_event(&conn_open(100, "tcp4", "a", "b", 20));
         let g = b.build();
-        let edges: Vec<_> = g.edges.iter()
+        let edges: Vec<_> = g
+            .edges
+            .iter()
             .filter(|e| matches!(e, Edge::OpenedSocket { .. }))
             .collect();
         assert_eq!(edges.len(), 1);
@@ -640,7 +766,10 @@ mod tests {
         // No process node — socket has nothing to attach to.
         b.on_event(&conn_open(999, "tcp4", "a", "b", 20));
         let g = b.build();
-        assert!(!g.edges.iter().any(|e| matches!(e, Edge::OpenedSocket { .. })));
+        assert!(!g
+            .edges
+            .iter()
+            .any(|e| matches!(e, Edge::OpenedSocket { .. })));
     }
 
     #[test]
@@ -655,7 +784,10 @@ mod tests {
         assert!(g.files[0].flags.contains(&"created".to_string()));
         assert!(g.files[0].flags.contains(&"modified".to_string()));
         // Flag should appear once even though it was observed twice.
-        assert_eq!(g.files[0].flags.iter().filter(|f| **f == "is_file").count(), 1);
+        assert_eq!(
+            g.files[0].flags.iter().filter(|f| **f == "is_file").count(),
+            1
+        );
     }
 
     #[test]
@@ -668,7 +800,9 @@ mod tests {
         // Socket opens at t=50 while the new process is alive.
         b.on_event(&conn_open(100, "tcp4", "a", "b", 50));
         let g = b.build();
-        let edges: Vec<_> = g.edges.iter()
+        let edges: Vec<_> = g
+            .edges
+            .iter()
             .filter_map(|e| match e {
                 Edge::OpenedSocket { process, .. } => Some(process.start_unix_secs),
                 _ => None,

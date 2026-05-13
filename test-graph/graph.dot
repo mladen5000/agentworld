@@ -1,0 +1,7 @@
+digraph agentworld {
+  rankdir=LR;
+  graph [fontname="Helvetica"];
+  node  [fontname="Helvetica", fontsize=10];
+  edge  [fontname="Helvetica", fontsize=9];
+  "a_com.microsoft.VSCodeInsiders" [shape=ellipse, style=filled, fillcolor="#fff4c2", label="Code - Insiders", tooltip="/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Code - Insiders"];
+}

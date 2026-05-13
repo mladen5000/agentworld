@@ -1,0 +1,36 @@
+digraph agentworld {
+  rankdir=LR;
+  graph [fontname="Helvetica"];
+  node  [fontname="Helvetica", fontsize=10];
+  edge  [fontname="Helvetica", fontsize=9];
+  "p_92322_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="aw-observe\npid 92322", tooltip="/Users/mladenrasic/Projects/agentworld/target/debug/aw-observe"];
+  "p_92393_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92393", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92394_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92394", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92392_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92392", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92353_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="sudo\npid 92353", tooltip="/usr/bin/sudo"];
+  "p_92395_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92395", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92396_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92396", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92323_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="aw-observe\npid 92323", tooltip="/Users/mladenrasic/Projects/agentworld/target/debug/aw-observe"];
+  "p_92391_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="eslogger\npid 92391", tooltip="/usr/bin/eslogger"];
+  "p_92390_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="sudo\npid 92390", tooltip="/usr/bin/sudo"];
+  "p_92397_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92397", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92428_1778673218" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92428", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "p_92357_1778673217" [shape=box, style=filled, fillcolor="#ffd0d0", label="log\npid 92357", tooltip="/usr/bin/log"];
+  "p_92199_1778673211" [shape=box, style=filled, fillcolor="#d0e6ff", label="mdworker_shared\npid 92199", tooltip="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"];
+  "a_com.microsoft.VSCodeInsiders" [shape=ellipse, style=filled, fillcolor="#fff4c2", label="Code - Insiders", tooltip="/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Code - Insiders"];
+  "f__Users_mladenrasic_Projects_agentworld_test-graph_test-graph" [shape=note, style=filled, fillcolor="#fde2c2", label="test-graph", tooltip="/Users/mladenrasic/Projects/agentworld/test-graph/test-graph"];
+  "f__Users_mladenrasic_Library_Application_Support_Claude_sentry_scope_v3.json" [shape=note, style=filled, fillcolor="#fde2c2", label="scope_v3.json", tooltip="/Users/mladenrasic/Library/Application Support/Claude/sentry/scope_v3.json"];
+  "p_92390_1778673217" -> "p_92391_1778673217" [color="#444"];
+  "p_92353_1778673217" -> "p_92390_1778673217" [color="#444"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92393_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92394_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92392_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92353_1778673217" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92395_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92396_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92391_1778673217" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92390_1778673217" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92397_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92428_1778673218" [style=dashed, color="#bbb"];
+  "a_com.microsoft.VSCodeInsiders" -> "p_92357_1778673217" [style=dashed, color="#bbb"];
+}

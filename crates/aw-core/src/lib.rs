@@ -39,8 +39,11 @@ pub enum SourceBehavior {
 pub struct Timestamp {
     /// Nanoseconds since the clock's wall-clock anchor.
     pub mono_ns: u64,
-    /// Wall-clock anchor (unix epoch nanoseconds) for translation.
-    pub wall_anchor_ns: u128,
+    /// Wall-clock anchor (unix epoch nanoseconds) for translation. u64 holds
+    /// nanoseconds past 1970 through ~2554, ample for any current capture
+    /// and round-trips cleanly through serde_json (which doesn't natively
+    /// support u128 number deserialization).
+    pub wall_anchor_ns: u64,
 }
 
 /// Process-aware monotonic clock. Anchors `Instant::now()` against a wall-clock
@@ -48,14 +51,17 @@ pub struct Timestamp {
 #[derive(Debug, Clone)]
 pub struct MonotonicClock {
     start: Instant,
-    wall_anchor_ns: u128,
+    wall_anchor_ns: u64,
 }
 
 impl MonotonicClock {
     pub fn new() -> Self {
+        // `Duration::as_nanos` returns u128 because it can represent
+        // durations longer than u64::MAX nanoseconds; for unix-epoch
+        // distances the value comfortably fits in u64.
         let wall_anchor_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         Self { start: Instant::now(), wall_anchor_ns }
     }

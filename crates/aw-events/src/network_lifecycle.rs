@@ -37,6 +37,10 @@ struct ConnectionRecord {
     process_name: Option<String>,
     rxbytes: Option<u64>,
     txbytes: Option<u64>,
+    /// First time we observed this `(proto, local, foreign)` tuple. Preserved
+    /// across tick rotations so a `connection_completed` event can report the
+    /// true open-to-close duration, not just the most recent tick.
+    first_seen: Timestamp,
     last_seen: Timestamp,
 }
 
@@ -86,12 +90,22 @@ impl NetworkLifecycle {
         }
 
         let key = ConnectionKey { proto, local_addr, foreign_addr };
+        // Preserve the original first_seen if we've seen this tuple before
+        // either in the current tick (rare — duplicate inside one snapshot)
+        // or in the immediately prior tick (the common case).
+        let first_seen = self
+            .current
+            .get(&key)
+            .map(|r| r.first_seen)
+            .or_else(|| self.prior.get(&key).map(|r| r.first_seen))
+            .unwrap_or(obs.timestamp);
         let record = ConnectionRecord {
             state: p.get("state").and_then(|v| v.as_str()).map(String::from),
             pid: obs.pid,
             process_name: p.get("process_name").and_then(|v| v.as_str()).map(String::from),
             rxbytes: p.get("rxbytes").and_then(|v| v.as_u64()),
             txbytes: p.get("txbytes").and_then(|v| v.as_u64()),
+            first_seen,
             last_seen: obs.timestamp,
         };
         self.current.insert(key, record);
@@ -117,6 +131,7 @@ impl NetworkLifecycle {
             for (key, rec) in &self.prior {
                 if !self.current.contains_key(key) {
                     events.push(closed_event(key, rec, now));
+                    events.push(completed_event(key, rec, now));
                 }
             }
         } else {
@@ -163,6 +178,40 @@ fn closed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) -> 
             "rxbytes": rec.rxbytes,
             "txbytes": rec.txbytes,
             "last_seen": rec.last_seen,
+        }),
+    }
+}
+
+/// Synthetic per-connection summary. Emitted *alongside* `ConnectionClosed`
+/// at the tick boundary that detects the disappearance, so a single
+/// downstream consumer can derive answers like "what was the total bytes
+/// exchanged with 1.2.3.4 by `curl` during its 7-second lifetime?" without
+/// joining opened/closed pairs.
+///
+/// `duration_ns` is the wall-time span between `first_seen` and `last_seen`,
+/// not the moment of detection. Practically this means the duration is
+/// bounded above by the snapshot poll interval (the connection may have
+/// actually closed up to one tick before we noticed).
+fn completed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) -> Event {
+    let duration_ns = rec
+        .last_seen
+        .mono_ns
+        .saturating_sub(rec.first_seen.mono_ns);
+    Event {
+        timestamp: now,
+        kind: EventKind::ConnectionCompleted,
+        pid: rec.pid,
+        payload: json!({
+            "proto": key.proto,
+            "local_addr": key.local_addr,
+            "foreign_addr": key.foreign_addr,
+            "final_state": rec.state,
+            "process_name": rec.process_name,
+            "bytes_rx": rec.rxbytes,
+            "bytes_tx": rec.txbytes,
+            "opened_at": rec.first_seen,
+            "closed_at": rec.last_seen,
+            "duration_ns": duration_ns,
         }),
     }
 }
@@ -217,16 +266,20 @@ mod tests {
     }
 
     #[test]
-    fn disappeared_connection_emits_closed() {
+    fn disappeared_connection_emits_closed_and_completed() {
         let mut s = NetworkLifecycle::new();
         s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, 1));
         s.on_tick_complete(ts(2));
         // Tick 2: empty.
         let events = s.on_tick_complete(ts(3));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, EventKind::ConnectionClosed);
-        assert_eq!(events[0].payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
-        assert_eq!(events[0].timestamp, ts(3));
+        // One Closed and one Completed, in that order.
+        assert_eq!(events.len(), 2, "got {events:?}");
+        let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![EventKind::ConnectionClosed, EventKind::ConnectionCompleted]);
+        for e in &events {
+            assert_eq!(e.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
+            assert_eq!(e.timestamp, ts(3));
+        }
     }
 
     #[test]
@@ -256,16 +309,19 @@ mod tests {
         assert!(events.is_empty(), "tick 2 == tick 1 contents; got {events:?}");
 
         // Tick 4: a.1/b.2 again. Finalize tick 3 vs tick 2: tick 3 had {a.2/c.3}, tick 2 had {a.1/b.2}.
-        // Diff: a.2/c.3 opened, a.1/b.2 closed.
+        // Diff: a.2/c.3 opened, a.1/b.2 closed AND completed.
         let events = s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, 3 * one_sec + 1));
         let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
-        assert_eq!(kinds.len(), 2, "got {kinds:?}");
+        assert_eq!(kinds.len(), 3, "got {kinds:?}");
         assert!(kinds.contains(&EventKind::ConnectionOpened));
         assert!(kinds.contains(&EventKind::ConnectionClosed));
+        assert!(kinds.contains(&EventKind::ConnectionCompleted));
         let opened = events.iter().find(|e| e.kind == EventKind::ConnectionOpened).unwrap();
         let closed = events.iter().find(|e| e.kind == EventKind::ConnectionClosed).unwrap();
+        let completed = events.iter().find(|e| e.kind == EventKind::ConnectionCompleted).unwrap();
         assert_eq!(opened.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.2"));
         assert_eq!(closed.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
+        assert_eq!(completed.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
     }
 
     #[test]
@@ -276,5 +332,99 @@ mod tests {
         s.on_observation(&o);
         s.on_tick_complete(ts(2));
         assert!(s.prior.is_empty());
+    }
+
+    /// Helper that builds a netobs with explicit rxbytes/txbytes so we can
+    /// verify the `ConnectionCompleted` payload preserves cumulative byte
+    /// counts.
+    fn netobs_bytes(local: &str, foreign: &str, rx: u64, tx: u64, mono: u64) -> Observation {
+        Observation {
+            timestamp: ts(mono),
+            source: Source::Network,
+            pid: Some(7),
+            payload: json!({
+                "proto": "tcp4",
+                "local_addr": local,
+                "foreign_addr": foreign,
+                "state": "ESTABLISHED",
+                "process_name": "test",
+                "rxbytes": rx,
+                "txbytes": tx,
+            }),
+            tags: None,
+        }
+    }
+
+    #[test]
+    fn completed_event_carries_duration_and_byte_deltas() {
+        let mut s = NetworkLifecycle::new();
+        // Tick 1: first observation of the tuple, at t=1000, 100/50 bytes.
+        s.on_observation(&netobs_bytes("a.1", "b.2", 100, 50, 1000));
+        s.on_tick_complete(ts(2000));
+        // Tick 2: same tuple, more bytes accumulated. Note: nothing emits on
+        // this tick because the tuple was already in `prior`.
+        s.on_observation(&netobs_bytes("a.1", "b.2", 5000, 200, 3000));
+        s.on_tick_complete(ts(4000));
+        // Tick 3: tuple absent. Closed + Completed fire at ts=5000.
+        let events = s.on_tick_complete(ts(5000));
+
+        let completed = events
+            .iter()
+            .find(|e| e.kind == EventKind::ConnectionCompleted)
+            .expect("ConnectionCompleted should fire");
+
+        let p = &completed.payload;
+        assert_eq!(p.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
+        assert_eq!(p.get("foreign_addr").and_then(|v| v.as_str()), Some("b.2"));
+        // last_seen.mono_ns - first_seen.mono_ns = 3000 - 1000 = 2000.
+        assert_eq!(p.get("duration_ns").and_then(|v| v.as_u64()), Some(2000));
+        // bytes_rx/tx are the *last observed* cumulative values.
+        assert_eq!(p.get("bytes_rx").and_then(|v| v.as_u64()), Some(5000));
+        assert_eq!(p.get("bytes_tx").and_then(|v| v.as_u64()), Some(200));
+        // opened_at / closed_at preserved.
+        assert_eq!(
+            p.get("opened_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            Some(1000),
+        );
+        assert_eq!(
+            p.get("closed_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            Some(3000),
+        );
+    }
+
+    #[test]
+    fn first_seen_is_preserved_across_many_ticks() {
+        let mut s = NetworkLifecycle::new();
+        // Tuple first seen at t=100, observed in four consecutive ticks.
+        s.on_observation(&netobs("tcp4", "a", "b", Some("ESTABLISHED"), 1, 100));
+        s.on_tick_complete(ts(1000));
+        s.on_observation(&netobs("tcp4", "a", "b", Some("ESTABLISHED"), 1, 1100));
+        s.on_tick_complete(ts(2000));
+        s.on_observation(&netobs("tcp4", "a", "b", Some("ESTABLISHED"), 1, 2100));
+        s.on_tick_complete(ts(3000));
+        s.on_observation(&netobs("tcp4", "a", "b", Some("ESTABLISHED"), 1, 3100));
+        s.on_tick_complete(ts(4000));
+        // Tick where it vanishes (no obs for this tick at all):
+        let events = s.on_tick_complete(ts(5000));
+        let completed = events
+            .iter()
+            .find(|e| e.kind == EventKind::ConnectionCompleted)
+            .unwrap_or_else(|| panic!("expected Completed; got {events:?}"));
+        // Four rotations should not have lost first_seen.
+        assert_eq!(
+            completed.payload.get("opened_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            Some(100),
+            "first_seen survives rotation; payload={:?}",
+            completed.payload,
+        );
+        // last_seen should be the most recent obs (3100), not the close time (5000).
+        assert_eq!(
+            completed.payload.get("closed_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            Some(3100),
+        );
+        assert_eq!(
+            completed.payload.get("duration_ns").and_then(|v| v.as_u64()),
+            Some(3000),
+        );
     }
 }

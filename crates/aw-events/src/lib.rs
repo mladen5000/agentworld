@@ -55,6 +55,10 @@ pub enum EventKind {
     AppFocus,
     ConnectionOpened,
     ConnectionClosed,
+    /// Synthetic per-connection summary emitted alongside `ConnectionClosed`.
+    /// Carries `opened_at`, `closed_at`, `duration_ns`, and cumulative
+    /// `bytes_rx` / `bytes_tx`. See `network_lifecycle::completed_event`.
+    ConnectionCompleted,
     FileChanged,
     DnsQuery,
 }
@@ -146,6 +150,7 @@ impl Reconstructor {
                 }
                 EventKind::ConnectionOpened
                 | EventKind::ConnectionClosed
+                | EventKind::ConnectionCompleted
                 | EventKind::DnsQuery => {
                     out.push(annotate_pid_event(ev, &self.process_table));
                 }

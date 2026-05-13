@@ -14,6 +14,9 @@ members = [
     "crates/aw-events-cli",
     "crates/aw-graph",
     "crates/aw-graph-cli",
+    "crates/aw-llm",
+    "crates/aw-agents",
+    "crates/aw-agents-cli",
     "crates/aw-observe",
 ]
 
@@ -35,6 +38,8 @@ aw-dns = { path = "crates/aw-dns" }
 aw-eslogger = { path = "crates/aw-eslogger" }
 aw-events = { path = "crates/aw-events" }
 aw-graph = { path = "crates/aw-graph" }
+aw-llm = { path = "crates/aw-llm" }
+aw-agents = { path = "crates/aw-agents" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
