@@ -14,6 +14,7 @@ members = [
     "crates/aw-events-cli",
     "crates/aw-graph",
     "crates/aw-graph-cli",
+    "crates/aw-store",
     "crates/aw-llm",
     "crates/aw-agents",
     "crates/aw-agents-cli",
@@ -38,6 +39,7 @@ aw-dns = { path = "crates/aw-dns" }
 aw-eslogger = { path = "crates/aw-eslogger" }
 aw-events = { path = "crates/aw-events" }
 aw-graph = { path = "crates/aw-graph" }
+aw-store = { path = "crates/aw-store" }
 aw-llm = { path = "crates/aw-llm" }
 aw-agents = { path = "crates/aw-agents" }
 
