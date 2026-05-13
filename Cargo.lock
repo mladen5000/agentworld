@@ -40,6 +40,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-dns"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aw-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aw-eslogger"
 version = "0.1.0"
 dependencies = [
@@ -128,6 +139,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aw-core",
+ "aw-dns",
  "aw-eslogger",
  "aw-events",
  "aw-fsevents",

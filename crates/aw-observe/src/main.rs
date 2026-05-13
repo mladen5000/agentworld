@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use aw_core::{Bus, MonotonicClock};
+use aw_dns::DnsAdapter;
 use aw_eslogger::EsLoggerAdapter;
 use aw_events::Reconstructor;
 use aw_fsevents::FsEventsAdapter;
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
     scheduler.register(WindowAdapter::new());
     scheduler.register(SystemAdapter::new());
     scheduler.register(EsLoggerAdapter::new());
+    scheduler.register(DnsAdapter::new());
 
     tracing::info!(
         "aw-observe running; emitting {} on stdout. Ctrl-C to stop.",

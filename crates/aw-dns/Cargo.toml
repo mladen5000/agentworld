@@ -1,0 +1,14 @@
+[package]
+name = "aw-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DNS observation stream via `log stream` (mDNSResponder subsystem). Layer 1."
+
+[dependencies]
+aw-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

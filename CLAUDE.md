@@ -62,6 +62,7 @@ Serialization must be deterministic. Adapters must tolerate event loss without c
 - `crates/aw-scheduler` — ingestion scheduler: stream tasks, snapshot polling, diff state tracking.
 - `crates/aw-fsevents`, `aw-process`, `aw-network`, `aw-window`, `aw-system` — Layer 1 adapters with real macOS bindings (FSEvents, libproc, netstat, NSWorkspace, sysctl).
 - `crates/aw-eslogger` — Layer 1 adapter wrapping `sudo eslogger` for Endpoint Security events. Degrades to a single `warn!` and parks when sudo isn't available.
+- `crates/aw-dns` — Layer 1 adapter tapping `mDNSResponder` via `log stream`. No root needed; hostnames are privacy-masked unless `com.apple.system.logging.Enable-Private-Data` is installed. See [EVENTS.md](EVENTS.md#dns_query) for the redaction details.
 - `crates/aw-events` — Layer 2 library. `Reconstructor::process(&obs) -> Vec<Event>`. Stages live as submodules; first one is `process_lifecycle` (snapshot diff → birth/death). Each stage detects its own tick boundaries from gaps in its source's observation stream.
 - `crates/aw-events-cli` — `aw-events` binary: NDJSON observations on stdin → NDJSON events on stdout. For offline reprocessing of captured Layer 1 traces.
 - `crates/aw-graph` — Layer 3 library. `GraphBuilder` consumes observations + events; `build()` materializes a `Graph` of `ProcessNode`s, `AppNode`s, and edges (`parent_of`, `frontmost_during`). Includes a DOT serializer (`dot::to_dot`).

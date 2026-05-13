@@ -144,6 +144,10 @@ impl GraphBuilder {
             EventKind::ConnectionOpened => self.on_connection_opened(ev),
             EventKind::ConnectionClosed => self.on_connection_closed(ev),
             EventKind::FileChanged => self.on_file_changed(ev),
+            // DNS queries are not yet folded into the graph (no DomainName
+            // node type yet). They still advance `last_ts` above so interval
+            // closure remains correct.
+            EventKind::DnsQuery => {}
         }
     }
 

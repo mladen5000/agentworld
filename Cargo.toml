@@ -8,6 +8,7 @@ members = [
     "crates/aw-network",
     "crates/aw-window",
     "crates/aw-system",
+    "crates/aw-dns",
     "crates/aw-eslogger",
     "crates/aw-events",
     "crates/aw-events-cli",
@@ -30,6 +31,7 @@ aw-process = { path = "crates/aw-process" }
 aw-network = { path = "crates/aw-network" }
 aw-window = { path = "crates/aw-window" }
 aw-system = { path = "crates/aw-system" }
+aw-dns = { path = "crates/aw-dns" }
 aw-eslogger = { path = "crates/aw-eslogger" }
 aw-events = { path = "crates/aw-events" }
 aw-graph = { path = "crates/aw-graph" }

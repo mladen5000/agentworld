@@ -18,6 +18,7 @@ aw-process = { workspace = true }
 aw-network = { workspace = true }
 aw-window = { workspace = true }
 aw-system = { workspace = true }
+aw-dns = { workspace = true }
 aw-eslogger = { workspace = true }
 aw-events = { workspace = true }
 
