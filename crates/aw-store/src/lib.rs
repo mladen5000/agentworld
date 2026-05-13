@@ -426,6 +426,114 @@ impl Store {
             .filter(|p| (p.death.unwrap_or(p.birth).mono_ns) >= since_ns)
             .collect())
     }
+
+    /// Suspicion query: root-owned processes whose parent is a non-root user
+    /// process. A classic privilege-escalation shape — `sudo` is the expected
+    /// boring case, anything else warrants a look.
+    ///
+    /// The join is across the `parent_of` edge table; uid comparison happens
+    /// on the JSON `attrs` payload of each end.
+    pub fn processes_root_under_user_parent(&self) -> Result<Vec<ProcessNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT child.id, child.attrs, child.first_seen, child.last_seen
+             FROM edges e
+             JOIN nodes child  ON child.kind  = 'process' AND child.id  = e.to_id
+             JOIN nodes parent ON parent.kind = 'process' AND parent.id = e.from_id
+             WHERE e.kind = 'parent_of'
+               AND CAST(json_extract(child.attrs,  '$.uid') AS INTEGER) = 0
+               AND CAST(json_extract(parent.attrs, '$.uid') AS INTEGER) > 0",
+        )?;
+        let rows = stmt.query_map([], row_to_process_tuple)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(process_from_row(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Suspicion query: processes whose `exec_path` does not begin with any
+    /// of the allowed prefixes. Lets the agent supply its own policy of
+    /// "trusted locations" (e.g. `/usr/bin/`, `/System/`, `/Applications/`)
+    /// without baking it into the store.
+    ///
+    /// Processes with no `exec_path` at all are returned (we can't vouch for
+    /// them either). Empty `allowed_prefixes` is treated as "everything is
+    /// untrusted" and returns every process with an exec_path.
+    pub fn processes_outside_paths(&self, allowed_prefixes: &[&str]) -> Result<Vec<ProcessNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'",
+        )?;
+        let rows = stmt.query_map([], row_to_process_tuple)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let tuple = row?;
+            let p = process_from_row(tuple)?;
+            let trusted = match p.exec_path.as_deref() {
+                None => false, // unknown path is not "trusted"
+                Some(path) => allowed_prefixes.iter().any(|prefix| path.starts_with(prefix)),
+            };
+            if !trusted { out.push(p); }
+        }
+        Ok(out)
+    }
+
+    /// Suspicion query: parent processes whose child count is at least
+    /// `min_children`. Useful for spotting fork bombs, shells running long
+    /// scripts, or unusual fan-out from a process that normally doesn't
+    /// spawn anything.
+    ///
+    /// Returns `(parent_process, child_count)` pairs, sorted by descending
+    /// child count.
+    pub fn parents_with_many_children(&self, min_children: u32) -> Result<Vec<(ProcessNode, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id, parent.attrs, parent.first_seen, parent.last_seen, COUNT(*) AS n
+             FROM edges e
+             JOIN nodes parent ON parent.kind = 'process' AND parent.id = e.from_id
+             WHERE e.kind = 'parent_of'
+             GROUP BY parent.id
+             HAVING n >= ?1
+             ORDER BY n DESC",
+        )?;
+        let rows = stmt.query_map(params![min_children], |r| {
+            let id: String = r.get(0)?;
+            let attrs: String = r.get(1)?;
+            let first_seen: i64 = r.get(2)?;
+            let last_seen: i64 = r.get(3)?;
+            let n: i64 = r.get(4)?;
+            Ok(((id, attrs, first_seen, last_seen), n as u32))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (tuple, n) = row?;
+            out.push((process_from_row(tuple)?, n));
+        }
+        Ok(out)
+    }
+}
+
+// Shape of a `nodes` SELECT we project into `ProcessNode`: (id, attrs, first_seen, last_seen).
+type ProcessRow = (String, String, i64, i64);
+
+fn row_to_process_tuple(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+}
+
+fn process_from_row(row: ProcessRow) -> Result<ProcessNode> {
+    let (id_str, attrs, first_seen, _last_seen) = row;
+    let pid_id = process_id_from_string(&id_str);
+    let v: serde_json::Value = serde_json::from_str(&attrs)?;
+    let death_v = v.get("death").cloned().unwrap_or(serde_json::Value::Null);
+    let death: Option<Timestamp> = if death_v.is_null() { None } else { serde_json::from_value(death_v).ok() };
+    Ok(ProcessNode {
+        id: pid_id,
+        comm: v.get("comm").and_then(|x| x.as_str()).map(String::from),
+        name: v.get("name").and_then(|x| x.as_str()).map(String::from),
+        exec_path: v.get("exec_path").and_then(|x| x.as_str()).map(String::from),
+        ppid: v.get("ppid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
+        uid: v.get("uid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
+        birth: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
+        death,
+    })
 }
 
 // ---------- helpers --------------------------------------------------------
@@ -692,6 +800,87 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert_eq!(first_seen, 20);
+    }
+
+    /// Build a graph with a configurable parent/child uid/exec mix so the
+    /// suspicion-query tests are self-contained.
+    fn suspicion_graph() -> Graph {
+        let init = ProcessNode {
+            id: ProcessId { pid: 1, start_unix_secs: 1000 },
+            comm: Some("launchd".into()), name: None,
+            exec_path: Some("/sbin/launchd".into()),
+            ppid: None, uid: Some(0),
+            birth: ts(1), death: None,
+        };
+        // Non-root user shell.
+        let shell = ProcessNode {
+            id: ProcessId { pid: 100, start_unix_secs: 1001 },
+            comm: Some("zsh".into()), name: None,
+            exec_path: Some("/bin/zsh".into()),
+            ppid: Some(1), uid: Some(501),
+            birth: ts(2), death: None,
+        };
+        // Root child of the non-root shell — the suspicious one.
+        let suspicious = ProcessNode {
+            id: ProcessId { pid: 200, start_unix_secs: 1002 },
+            comm: Some("rooted".into()), name: None,
+            exec_path: Some("/tmp/rooted".into()),
+            ppid: Some(100), uid: Some(0),
+            birth: ts(3), death: None,
+        };
+        // Boring user process in /usr/bin — should NOT be flagged by either query.
+        let curl = ProcessNode {
+            id: ProcessId { pid: 300, start_unix_secs: 1003 },
+            comm: Some("curl".into()), name: None,
+            exec_path: Some("/usr/bin/curl".into()),
+            ppid: Some(100), uid: Some(501),
+            birth: ts(4), death: None,
+        };
+        Graph {
+            processes: vec![init.clone(), shell.clone(), suspicious.clone(), curl.clone()],
+            apps: vec![], sockets: vec![], files: vec![],
+            edges: vec![
+                Edge::ParentOf { parent: init.id.clone(),  child: shell.id.clone() },
+                Edge::ParentOf { parent: shell.id.clone(), child: suspicious.id.clone() },
+                Edge::ParentOf { parent: shell.id.clone(), child: curl.id.clone() },
+            ],
+        }
+    }
+
+    #[test]
+    fn root_under_user_parent_finds_only_the_escalation() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&suspicion_graph()).unwrap();
+        let hits = s.processes_root_under_user_parent().unwrap();
+        assert_eq!(hits.len(), 1, "expected exactly one escalation; got {hits:?}");
+        assert_eq!(hits[0].id.pid, 200);
+        assert_eq!(hits[0].comm.as_deref(), Some("rooted"));
+    }
+
+    #[test]
+    fn outside_paths_excludes_trusted_prefixes() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&suspicion_graph()).unwrap();
+        // /sbin/, /bin/, /usr/bin/ all trusted — only /tmp/rooted should remain.
+        let hits = s.processes_outside_paths(&["/sbin/", "/bin/", "/usr/bin/"]).unwrap();
+        assert_eq!(hits.len(), 1, "expected only /tmp/rooted; got {hits:?}");
+        assert_eq!(hits[0].exec_path.as_deref(), Some("/tmp/rooted"));
+    }
+
+    #[test]
+    fn parents_with_many_children_respects_threshold() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&suspicion_graph()).unwrap();
+        // shell (pid 100) has 2 children; launchd (pid 1) has 1.
+        let hits = s.parents_with_many_children(2).unwrap();
+        assert_eq!(hits.len(), 1, "only shell crosses threshold; got {hits:?}");
+        assert_eq!(hits[0].0.id.pid, 100);
+        assert_eq!(hits[0].1, 2);
+        // Lower the bar — both parents qualify, sorted by child count desc.
+        let all = s.parents_with_many_children(1).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0.id.pid, 100); // 2 children first
+        assert_eq!(all[1].0.id.pid, 1);   // then launchd with 1
     }
 
     #[test]

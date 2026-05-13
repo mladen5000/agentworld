@@ -11,6 +11,7 @@ aw-core = { workspace = true }
 aw-events = { workspace = true }
 aw-graph = { workspace = true }
 aw-llm = { workspace = true }
+aw-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

@@ -33,6 +33,7 @@ struct LlmResponse {
 #[derive(Debug, Clone, Serialize)]
 struct Aggregate {
     foreign_host: String,
+    foreign_port: String,
     process_name: String,
     connections: u32,
     bytes_rx: u64,
@@ -55,11 +56,13 @@ impl NetworkReviewer {
 
         let table = render_table(to_send);
         let prompt = format!(
-            "Below is a summary of {used} of {total} (host, process) pairs that exchanged \
-             traffic during a macOS capture. Identify any that look notable: unusual \
-             destinations, processes that should not normally make network connections, \
-             unexpected port choices, or suspiciously high volume. Do not flag well-known \
-             services unless context suggests misuse. Return ONLY valid JSON of this shape:\n\
+            "Below is a summary of {used} of {total} (host, port, process) triples that \
+             exchanged traffic during a macOS capture. Identify any that look notable: \
+             unusual destinations, processes that should not normally make network \
+             connections, unexpected port choices (e.g. shells talking to :22 or :3389, \
+             non-browsers on :80/:443 to non-CDN hosts), or suspiciously high volume. Do \
+             not flag well-known services unless context suggests misuse. Return ONLY \
+             valid JSON of this shape:\n\
              {{\n  \"summary\": \"<one or two sentences\">\",\n  \
              \"findings\": [\n    {{ \"foreign_host\": \"<string>\", \
              \"process_name\": \"<string or null>\", \"reason\": \"<concise English>\", \
@@ -114,18 +117,21 @@ impl NetworkReviewer {
 
 fn aggregate(events: &[Event]) -> Vec<Aggregate> {
     use std::collections::HashMap;
-    // Key: (foreign_host, process_name).
-    let mut map: HashMap<(String, String), Aggregate> = HashMap::new();
+    // Key: (foreign_host, foreign_port, process_name). Port is part of the
+    // key because the same host on :22 vs :443 is operationally very
+    // different — collapsing them hides the signal the LLM needs to flag.
+    let mut map: HashMap<(String, String, String), Aggregate> = HashMap::new();
     for ev in events.iter().filter(|e| e.kind == EventKind::ConnectionCompleted) {
         let foreign_addr = ev.payload.get("foreign_addr").and_then(|v| v.as_str()).unwrap_or("?");
-        let foreign_host = foreign_addr.rsplit_once('.').map(|(host, _port)| host.to_string()).unwrap_or_else(|| foreign_addr.to_string());
+        let (foreign_host, foreign_port) = split_host_port(foreign_addr);
         let proc_name = ev.payload.get("process_name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
         let bytes_rx = ev.payload.get("bytes_rx").and_then(|v| v.as_u64()).unwrap_or(0);
         let bytes_tx = ev.payload.get("bytes_tx").and_then(|v| v.as_u64()).unwrap_or(0);
         let duration_ms = ev.payload.get("duration_ns").and_then(|v| v.as_u64()).unwrap_or(0) / 1_000_000;
 
-        let entry = map.entry((foreign_host.clone(), proc_name.clone())).or_insert(Aggregate {
-            foreign_host: foreign_host.clone(),
+        let entry = map.entry((foreign_host.clone(), foreign_port.clone(), proc_name.clone())).or_insert(Aggregate {
+            foreign_host,
+            foreign_port,
             process_name: proc_name,
             connections: 0,
             bytes_rx: 0,
@@ -144,10 +150,21 @@ fn aggregate(events: &[Event]) -> Vec<Aggregate> {
     out
 }
 
+/// Split a netstat-style `host.port` address (e.g. `1.2.3.4.443`,
+/// `fe80::1.22`) into `(host, port)`. IPv6 addresses use `.` as the
+/// host/port separator in macOS netstat output too, so a simple
+/// `rsplit_once('.')` is sufficient.
+fn split_host_port(addr: &str) -> (String, String) {
+    match addr.rsplit_once('.') {
+        Some((host, port)) => (host.to_string(), port.to_string()),
+        None => (addr.to_string(), "?".to_string()),
+    }
+}
+
 fn render_table(rows: &[Aggregate]) -> String {
     rows.iter().map(|r| format!(
-        "host={} process={} conns={} bytes_rx={} bytes_tx={} duration_ms={}",
-        r.foreign_host, r.process_name, r.connections, r.bytes_rx, r.bytes_tx, r.total_duration_ms,
+        "host={} port={} process={} conns={} bytes_rx={} bytes_tx={} duration_ms={}",
+        r.foreign_host, r.foreign_port, r.process_name, r.connections, r.bytes_rx, r.bytes_tx, r.total_duration_ms,
     )).collect::<Vec<_>>().join("\n")
 }
 
@@ -178,20 +195,42 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_collapses_same_host_and_process() {
+    fn aggregate_collapses_same_host_port_and_process() {
         let evs = vec![
             completed("1.2.3.4.443", "curl", 100, 50, 10),
             completed("1.2.3.4.443", "curl", 200, 50, 20),
             completed("9.9.9.9.80", "curl", 5, 5, 1),
         ];
         let aggs = aggregate(&evs);
-        // 1.2.3.4 collapses into one row; 9.9.9.9 is its own row.
-        let s = aggs.iter().find(|a| a.foreign_host == "1.2.3.4").unwrap();
+        // 1.2.3.4:443 collapses into one row; 9.9.9.9:80 is its own row.
+        let s = aggs.iter().find(|a| a.foreign_host == "1.2.3.4" && a.foreign_port == "443").unwrap();
         assert_eq!(s.connections, 2);
         assert_eq!(s.bytes_rx, 300);
         assert_eq!(s.bytes_tx, 100);
         // First row by sort order is the bigger one.
         assert_eq!(aggs[0].foreign_host, "1.2.3.4");
+        assert_eq!(aggs[0].foreign_port, "443");
+    }
+
+    #[test]
+    fn aggregate_keeps_different_ports_separate() {
+        // Same host, same process, different ports — must NOT collapse.
+        // A shell talking to :22 is operationally very different from :443.
+        let evs = vec![
+            completed("1.2.3.4.443", "curl", 100, 50, 10),
+            completed("1.2.3.4.22",  "curl", 7,   3,  1),
+        ];
+        let aggs = aggregate(&evs);
+        assert_eq!(aggs.len(), 2, "different ports must stay separate; got {aggs:?}");
+        assert!(aggs.iter().any(|a| a.foreign_port == "443"));
+        assert!(aggs.iter().any(|a| a.foreign_port == "22"));
+    }
+
+    #[test]
+    fn rendered_table_includes_port() {
+        let aggs = aggregate(&[completed("1.2.3.4.22", "ssh", 10, 10, 1)]);
+        let table = render_table(&aggs);
+        assert!(table.contains("port=22"), "rendered table must surface port; got: {table}");
     }
 
     #[tokio::test]

@@ -4,11 +4,13 @@
 //!
 //!   aw-agents timeline         < events.ndjson
 //!   aw-agents process-anomaly  --graph ./out/graph.json
+//!   aw-agents process-anomaly  --store ./world.db
 //!   aw-agents network-review   < events.ndjson
 //!
 //! All subcommands accept `--model <name>` (default `gemma3:4b`),
 //! `--ollama-url <url>` (default `http://127.0.0.1:11434`),
-//! and `--pretty` to print the report as human-readable text instead of JSON.
+//! `--max-items <n>` (default 200), and `--pretty` to print the report as
+//! human-readable text instead of JSON.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +30,7 @@ struct Args {
     model: String,
     ollama_url: String,
     graph_path: Option<PathBuf>,
+    store_path: Option<PathBuf>,
     pretty: bool,
     max_input_items: usize,
 }
@@ -49,6 +52,7 @@ fn parse_args() -> Result<Args> {
     let mut model = "gemma3:4b".to_string();
     let mut ollama_url = "http://127.0.0.1:11434".to_string();
     let mut graph_path = None;
+    let mut store_path = None;
     let mut pretty = false;
     let mut max_input_items: usize = 200;
 
@@ -57,6 +61,7 @@ fn parse_args() -> Result<Args> {
             "--model" => model = iter.next().context("--model requires a value")?,
             "--ollama-url" => ollama_url = iter.next().context("--ollama-url requires a value")?,
             "--graph" => graph_path = Some(PathBuf::from(iter.next().context("--graph requires a path")?)),
+            "--store" => store_path = Some(PathBuf::from(iter.next().context("--store requires a path")?)),
             "--pretty" => pretty = true,
             "--max-items" => {
                 let s = iter.next().context("--max-items requires a value")?;
@@ -67,7 +72,7 @@ fn parse_args() -> Result<Args> {
         }
     }
 
-    Ok(Args { subcommand, model, ollama_url, graph_path, pretty, max_input_items })
+    Ok(Args { subcommand, model, ollama_url, graph_path, store_path, pretty, max_input_items })
 }
 
 fn print_usage() {
@@ -75,13 +80,14 @@ fn print_usage() {
     eprintln!();
     eprintln!("subcommands:");
     eprintln!("  timeline           reads NDJSON events from stdin");
-    eprintln!("  process-anomaly    reads --graph <path>");
+    eprintln!("  process-anomaly    reads --graph <path> OR --store <db-path>");
     eprintln!("  network-review     reads NDJSON events from stdin");
     eprintln!();
     eprintln!("options:");
     eprintln!("  --model <name>           default: gemma3:4b");
     eprintln!("  --ollama-url <url>       default: http://127.0.0.1:11434");
-    eprintln!("  --graph <path>           required for process-anomaly");
+    eprintln!("  --graph <path>           graph.json source for process-anomaly");
+    eprintln!("  --store <db-path>        Layer 4 sqlite source for process-anomaly");
     eprintln!("  --max-items <n>          default: 200");
     eprintln!("  --pretty                 human-readable output (default: JSON)");
 }
@@ -111,11 +117,25 @@ async fn main() -> Result<()> {
             aw_agents::timeline_narrator::TimelineNarrator::new(ctx).run(&events).await?
         }
         Subcommand::ProcessAnomaly => {
-            let path = args.graph_path
-                .ok_or_else(|| anyhow!("--graph <path> is required for process-anomaly"))?;
-            let graph = aw_agents::input::read_graph(&path)?;
-            eprintln!("aw-agents: read graph with {} processes", graph.processes.len());
-            aw_agents::process_anomaly::ProcessAnomalyDetector::new(ctx).run(&graph).await?
+            let detector = aw_agents::process_anomaly::ProcessAnomalyDetector::new(ctx);
+            match (args.graph_path.as_ref(), args.store_path.as_ref()) {
+                (Some(_), Some(_)) => bail!("--graph and --store are mutually exclusive"),
+                (Some(p), None) => {
+                    let g = aw_agents::input::read_graph(p)?;
+                    eprintln!("aw-agents: read graph from {} with {} processes", p.display(), g.processes.len());
+                    detector.run(&g).await?
+                }
+                (None, Some(p)) => {
+                    // `run_from_store` issues each suspicion query as its own
+                    // SQL statement — the LLM only sees the candidates that
+                    // matched, never the full process list.
+                    let store = aw_store::Store::open(p)
+                        .with_context(|| format!("opening store at {}", p.display()))?;
+                    eprintln!("aw-agents: running suspicion queries against store {}", p.display());
+                    detector.run_from_store(&store).await?
+                }
+                (None, None) => bail!("process-anomaly requires --graph <path> or --store <db-path>"),
+            }
         }
         Subcommand::NetworkReview => {
             let events = aw_agents::input::read_events(std::io::stdin())?;
