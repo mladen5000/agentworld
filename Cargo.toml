@@ -11,6 +11,8 @@ members = [
     "crates/aw-eslogger",
     "crates/aw-events",
     "crates/aw-events-cli",
+    "crates/aw-graph",
+    "crates/aw-graph-cli",
     "crates/aw-observe",
 ]
 
@@ -30,6 +32,7 @@ aw-window = { path = "crates/aw-window" }
 aw-system = { path = "crates/aw-system" }
 aw-eslogger = { path = "crates/aw-eslogger" }
 aw-events = { path = "crates/aw-events" }
+aw-graph = { path = "crates/aw-graph" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }

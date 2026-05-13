@@ -14,7 +14,7 @@ The authoritative architectural spec is [ARCHITECTURE.md](ARCHITECTURE.md). Read
 
 - **Layer 1 — Observation Kernel** (implemented): source adapters → normalization → `Observation` stream on a bus.
 - **Layer 2 — Event Reconstruction** (in progress): consumes `Observation`s, emits canonical `Event`s. Currently implements process-lifecycle compression (snapshot diff → `process_birth` / `process_death`). Lives in `aw-events`.
-- **Layer 3 — World Model Graph** (future, not scaffolded): entity graph, behavioral edges, temporal indexing.
+- **Layer 3 — World Model Graph** (first slice implemented): consumes Layer 1 observations + Layer 2 events and materializes an entity graph. Currently: `Process` and `App` nodes; `parent_of` and `frontmost_during` edges. Offline-only — `aw-graph-cli` reads a captured NDJSON trace and emits `graph.dot` + `graph.json`. Lives in `aw-graph`.
 
 Hard boundaries — never blur:
 
@@ -64,6 +64,8 @@ Serialization must be deterministic. Adapters must tolerate event loss without c
 - `crates/aw-eslogger` — Layer 1 adapter wrapping `sudo eslogger` for Endpoint Security events. Degrades to a single `warn!` and parks when sudo isn't available.
 - `crates/aw-events` — Layer 2 library. `Reconstructor::process(&obs) -> Vec<Event>`. Stages live as submodules; first one is `process_lifecycle` (snapshot diff → birth/death). Each stage detects its own tick boundaries from gaps in its source's observation stream.
 - `crates/aw-events-cli` — `aw-events` binary: NDJSON observations on stdin → NDJSON events on stdout. For offline reprocessing of captured Layer 1 traces.
+- `crates/aw-graph` — Layer 3 library. `GraphBuilder` consumes observations + events; `build()` materializes a `Graph` of `ProcessNode`s, `AppNode`s, and edges (`parent_of`, `frontmost_during`). Includes a DOT serializer (`dot::to_dot`).
+- `crates/aw-graph-cli` — `aw-graph` binary: NDJSON (mixed observations + events) on stdin → `graph.dot` + `graph.json` under `--out-dir`.
 - `crates/aw-observe` — main binary. Default: emits Layer 2 events on stdout. `--raw` interleaves Layer 1 observations too.
 
 ## macOS permission requirements
@@ -86,6 +88,7 @@ cargo run --bin aw-observe           # emit Layer 2 events to stdout
 cargo run --bin aw-observe -- --raw  # also include Layer 1 observations
 cargo run --bin aw-observe -- --raw > obs.ndjson   # capture for offline
 cargo run --bin aw-events < obs.ndjson             # reprocess captured trace
+cargo run --bin aw-graph -- --out-dir ./out < obs.ndjson  # build Layer 3 graph
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```

@@ -16,7 +16,10 @@
 //! - It does not infer causality, attribute parents, or detect anomalies.
 //!   It only compresses snapshots into birth/death events for now.
 
+pub mod fsevents_coalesce;
+pub mod network_lifecycle;
 pub mod process_lifecycle;
+pub mod window_lifecycle;
 
 use aw_core::{Observation, Source, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -37,17 +40,29 @@ pub struct Event {
 pub enum EventKind {
     ProcessBirth,
     ProcessDeath,
+    AppFocus,
+    ConnectionOpened,
+    ConnectionClosed,
+    FileChanged,
 }
 
 /// The top-level Layer 2 pipeline. Routes each observation to the appropriate
 /// per-source stage and collects emitted events.
 pub struct Reconstructor {
     process: process_lifecycle::ProcessLifecycle,
+    window: window_lifecycle::WindowLifecycle,
+    network: network_lifecycle::NetworkLifecycle,
+    fsevents: fsevents_coalesce::FsEventsCoalesce,
 }
 
 impl Reconstructor {
     pub fn new() -> Self {
-        Self { process: process_lifecycle::ProcessLifecycle::new() }
+        Self {
+            process: process_lifecycle::ProcessLifecycle::new(),
+            window: window_lifecycle::WindowLifecycle::new(),
+            network: network_lifecycle::NetworkLifecycle::new(),
+            fsevents: fsevents_coalesce::FsEventsCoalesce::new(),
+        }
     }
 
     /// Feed one Layer 1 observation through the pipeline. Returns any events
@@ -55,17 +70,21 @@ impl Reconstructor {
     pub fn process(&mut self, obs: &Observation) -> Vec<Event> {
         match obs.source {
             Source::Process => self.process.on_observation(obs),
-            // Other sources are passed through silently for now. As stages
-            // are added (network/fsevents/window), wire them here.
+            Source::Window => self.window.on_observation(obs),
+            Source::Network => self.network.on_observation(obs),
+            Source::FileSystem => self.fsevents.on_observation(obs),
             _ => Vec::new(),
         }
     }
 
-    /// Force-emit any pending events that depend on a tick boundary. Should be
-    /// called once per scheduler tick after the burst of observations for that
-    /// tick has been delivered. (Process diffing uses this to detect deaths.)
+    /// Force-emit any pending events. Called at scheduler-tick boundaries in
+    /// live mode and at EOF in offline mode. Drains both snapshot-diff stages
+    /// (for the last in-flight tick) and the fsevents coalescer's idle buffer.
     pub fn on_tick_complete(&mut self, now: Timestamp) -> Vec<Event> {
-        self.process.on_tick_complete(now)
+        let mut events = self.process.on_tick_complete(now);
+        events.extend(self.network.on_tick_complete(now));
+        events.extend(self.fsevents.flush_all());
+        events
     }
 }
 

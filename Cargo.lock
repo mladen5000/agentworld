@@ -88,6 +88,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-graph"
+version = "0.1.0"
+dependencies = [
+ "aw-core",
+ "aw-events",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "aw-graph-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aw-core",
+ "aw-events",
+ "aw-graph",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aw-network"
 version = "0.1.0"
 dependencies = [
