@@ -19,7 +19,9 @@ members = [
     "crates/aw-agents",
     "crates/aw-agents-cli",
     "crates/aw-observe",
+    "crates/aw-mvp",
 ]
+default-members = ["crates/aw-mvp"]
 
 [workspace.package]
 version = "0.1.0"

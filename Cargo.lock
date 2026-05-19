@@ -178,6 +178,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-mvp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aw-agents",
+ "aw-core",
+ "aw-dns",
+ "aw-eslogger",
+ "aw-events",
+ "aw-fsevents",
+ "aw-graph",
+ "aw-llm",
+ "aw-network",
+ "aw-process",
+ "aw-scheduler",
+ "aw-system",
+ "aw-window",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aw-network"
 version = "0.1.0"
 dependencies = [
