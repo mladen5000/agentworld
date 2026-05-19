@@ -14,7 +14,7 @@
 use aw_core::Observation;
 use serde_json::json;
 
-use crate::{Event, EventKind};
+use crate::{Event, EventKind, SCHEMA_VERSION};
 
 pub struct WindowLifecycle;
 
@@ -48,6 +48,7 @@ impl WindowLifecycle {
             .or(obs.pid);
 
         vec![Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: obs.timestamp,
             kind: EventKind::AppFocus,
             pid,

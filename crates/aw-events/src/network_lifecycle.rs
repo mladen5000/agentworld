@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use aw_core::{Observation, Timestamp};
 use serde_json::json;
 
-use crate::{Event, EventKind};
+use crate::{Event, EventKind, SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConnectionKey {
@@ -149,6 +149,7 @@ impl Default for NetworkLifecycle {
 
 fn opened_event(key: &ConnectionKey, rec: &ConnectionRecord) -> Event {
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: rec.last_seen,
         kind: EventKind::ConnectionOpened,
         pid: rec.pid,
@@ -166,6 +167,7 @@ fn opened_event(key: &ConnectionKey, rec: &ConnectionRecord) -> Event {
 
 fn closed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) -> Event {
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: now,
         kind: EventKind::ConnectionClosed,
         pid: rec.pid,
@@ -198,6 +200,7 @@ fn completed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) 
         .mono_ns
         .saturating_sub(rec.first_seen.mono_ns);
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: now,
         kind: EventKind::ConnectionCompleted,
         pid: rec.pid,

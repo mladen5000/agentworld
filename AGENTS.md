@@ -13,8 +13,9 @@ The authoritative architectural spec is [ARCHITECTURE.md](ARCHITECTURE.md). Read
 ## Layered architecture
 
 - **Layer 1 — Observation Kernel** (implemented): source adapters → normalization → `Observation` stream on a bus.
-- **Layer 2 — Event Reconstruction** (in progress): consumes `Observation`s, emits canonical `Event`s. Currently implements process-lifecycle compression (snapshot diff → `process_birth` / `process_death`). Lives in `aw-events`.
-- **Layer 3 — World Model Graph** (first slice implemented): consumes Layer 1 observations + Layer 2 events and materializes an entity graph. Currently: `Process` and `App` nodes; `parent_of` and `frontmost_during` edges. Offline-only — `aw-graph-cli` reads a captured NDJSON trace and emits `graph.dot` + `graph.json`. Lives in `aw-graph`.
+- **Layer 2 — Event Reconstruction** (implemented): consumes `Observation`s, emits canonical `Event`s. Lives in `aw-events`. Five stages implemented: `process_lifecycle` (snapshot diff → birth/death), `window_lifecycle` (frontmost transitions → `app_focus`), `network_lifecycle` (socket-set diff → connection open/close/complete), `fsevents_coalesce` (windowed compression → `file_changed`), `dns_lifecycle` (mDNSResponder stream → `dns_query`). Each stage detects its own tick boundaries from gaps in its source's observation stream.
+- **Layer 3 — World Model Graph** (implemented, offline + in-process): consumes Layer 1 observations + Layer 2 events and materializes an entity graph. Nodes: `Process`, `App`, `Socket`, `File`. Edges: `parent_of`, `frontmost_during`, `opened_socket`. `aw-graph-cli` reads a captured NDJSON trace and emits `graph.dot` + `graph.json`. Lives in `aw-graph`. In-memory only; persistence is Layer 4.
+- **Layer 4 — Persistent World Model** (implemented): SQLite-backed durable mirror of the graph. Two tables (`nodes`, `edges`) with upsert-with-count semantics — repeated observations of the same entity increment a count rather than insert duplicate rows, so growth is bounded by distinct entities, not by sample rate. Wall-clock unix-ns timestamps. Lives in `aw-store`. Read by the apps layer; not consulted by the kernel.
 
 Hard boundaries — never blur:
 
@@ -22,8 +23,19 @@ Hard boundaries — never blur:
 - observation ≠ event
 - event ≠ graph edge
 - graph ≠ inference
+- kernel (Layers 1–3) ≠ apps layer
 
-If a change in Layer 1 starts inferring meaning, merging signals, or detecting anomalies, it belongs in Layer 2 — stop and reconsider.
+If a change in Layer 1 starts inferring meaning, merging signals, or detecting anomalies, it belongs in Layer 2 — stop and reconsider. If a change in Layers 1–3 starts narrating, scoring, or judging, it belongs in the apps layer — same rule.
+
+## Apps layer (built on top of the kernel)
+
+The apps layer reads Layers 2/3/4 and is allowed to do everything the kernel must not: infer, narrate, score, detect, summarize. Apps must never feed back into Layer 1–3 outputs; the kernel remains the source of truth.
+
+- `aw-llm` — local model client. Currently wraps Ollama over HTTP; behind an `LlmClient` trait so apps can be tested without a live model.
+- `aw-agents` — readers that consume Layer 2 events and/or Layer 3/4 graph state and call an `LlmClient`. Implemented: `TimelineNarrator` (focus segments → narrative), `ProcessAnomalyDetector` (lineage/uid/name heuristics), `NetworkReviewer` (notable connections).
+- `aw-mvp` — end-to-end runner: spins all Layer 1 adapters, drives the Layer 2 reconstructor, materializes the Layer 3 graph, persists to Layer 4, and invokes agents. One-shot or `--daemon` mode.
+
+Agents take `Arc<dyn LlmClient>`. Tests against the agents layer must use a mock client; never require Ollama at test time.
 
 ## Design invariants (Layer 1 hard rules)
 
@@ -58,16 +70,29 @@ Serialization must be deterministic. Adapters must tolerate event loss without c
 
 ## Crate layout
 
+Kernel (Layers 1–3) and the persistence layer (Layer 4):
+
 - `crates/aw-core` — `Observation`, `Source`, `SourceBehavior`, `MonotonicClock`, `Bus`. The contract lives here.
 - `crates/aw-scheduler` — ingestion scheduler: stream tasks, snapshot polling, diff state tracking.
 - `crates/aw-fsevents`, `aw-process`, `aw-network`, `aw-window`, `aw-system` — Layer 1 adapters with real macOS bindings (FSEvents, libproc, netstat, NSWorkspace, sysctl).
 - `crates/aw-eslogger` — Layer 1 adapter wrapping `sudo eslogger` for Endpoint Security events. Degrades to a single `warn!` and parks when sudo isn't available.
 - `crates/aw-dns` — Layer 1 adapter tapping `mDNSResponder` via `log stream`. No root needed; hostnames are privacy-masked unless `com.apple.system.logging.Enable-Private-Data` is installed. See [EVENTS.md](EVENTS.md#dns_query) for the redaction details.
-- `crates/aw-events` — Layer 2 library. `Reconstructor::process(&obs) -> Vec<Event>`. Stages live as submodules; first one is `process_lifecycle` (snapshot diff → birth/death). Each stage detects its own tick boundaries from gaps in its source's observation stream.
+- `crates/aw-events` — Layer 2 library. `Reconstructor::process(&obs) -> Vec<Event>`. Stages live as submodules: `process_lifecycle`, `window_lifecycle`, `network_lifecycle`, `fsevents_coalesce`, `dns_lifecycle`. Each stage detects its own tick boundaries from gaps in its source's observation stream.
+- `crates/aw-graph` — Layer 3 library. `GraphBuilder` consumes observations + events; `build()` materializes a `Graph` of `ProcessNode`s, `AppNode`s, `SocketNode`s, `FileNode`s, and edges (`parent_of`, `frontmost_during`, `opened_socket`). Includes a DOT serializer (`dot::to_dot`) and JSON output.
+- `crates/aw-store` — Layer 4 library. SQLite-backed persistent mirror of the graph; `nodes` and `edges` tables with upsert-with-count semantics so growth is bounded by distinct entities. Wall-clock unix-ns timestamps for cross-session continuity.
+
+Apps layer (everything below this line may infer, narrate, or judge):
+
+- `crates/aw-llm` — local model client. Wraps Ollama over HTTP (`reqwest`); single `generate()` method on the `LlmClient` trait. Trait exists so apps can be tested with a mock client.
+- `crates/aw-agents` — readers over Layer 2/3/4. `TimelineNarrator` builds a `CaptureSummary` (focus segments, top processes, endpoints, directories, DNS clients) and narrates it; `ProcessAnomalyDetector` and `NetworkReviewer` flag notable items via the same `LlmClient`.
+
+Binaries:
+
+- `crates/aw-observe` — Layer 1 + 2 runner. Default: emits Layer 2 events on stdout. `--raw` interleaves Layer 1 observations too. Use this to capture NDJSON traces for offline replay.
 - `crates/aw-events-cli` — `aw-events` binary: NDJSON observations on stdin → NDJSON events on stdout. For offline reprocessing of captured Layer 1 traces.
-- `crates/aw-graph` — Layer 3 library. `GraphBuilder` consumes observations + events; `build()` materializes a `Graph` of `ProcessNode`s, `AppNode`s, and edges (`parent_of`, `frontmost_during`). Includes a DOT serializer (`dot::to_dot`).
 - `crates/aw-graph-cli` — `aw-graph` binary: NDJSON (mixed observations + events) on stdin → `graph.dot` + `graph.json` under `--out-dir`.
-- `crates/aw-observe` — main binary. Default: emits Layer 2 events on stdout. `--raw` interleaves Layer 1 observations too.
+- `crates/aw-agents-cli` — runs one agent (`timeline`, `process-anomaly`, `network-review`) against an events NDJSON file or a persisted graph/store path; outputs a JSON report (`--pretty` for text).
+- `crates/aw-mvp` — end-to-end runner: capture → reconstruct → graph → persist → narrate. Default 30s one-shot capture; `--daemon` runs forever emitting narration every `--tick` over `--window`. The natural seed for product surfaces built on top of the kernel.
 
 ## macOS permission requirements
 
@@ -90,6 +115,9 @@ cargo run --bin aw-observe -- --raw  # also include Layer 1 observations
 cargo run --bin aw-observe -- --raw > obs.ndjson   # capture for offline
 cargo run --bin aw-events < obs.ndjson             # reprocess captured trace
 cargo run --bin aw-graph -- --out-dir ./out < obs.ndjson  # build Layer 3 graph
+cargo run --bin aw-mvp                              # one-shot 30s capture → narrate
+cargo run --bin aw-mvp -- --daemon                  # run forever, narrate every --tick
+cargo run --bin aw-agents-cli -- timeline --events events.ndjson --pretty
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```

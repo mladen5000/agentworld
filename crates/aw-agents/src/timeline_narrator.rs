@@ -21,6 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use aw_events::{Event, EventKind};
+#[cfg(test)]
+use aw_events::SCHEMA_VERSION;
 use aw_llm::{GenerateRequest, Options};
 use serde::{Deserialize, Serialize};
 
@@ -569,6 +571,7 @@ mod tests {
 
     fn ev(kind: EventKind, mono_ms: u64, pid: Option<u32>, payload: serde_json::Value) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: Timestamp { mono_ns: mono_ms * 1_000_000, wall_anchor_ns: 0 },
             kind, pid, payload,
         }

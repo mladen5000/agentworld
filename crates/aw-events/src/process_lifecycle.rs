@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use aw_core::{Observation, Timestamp};
 use serde_json::json;
 
-use crate::{Event, EventKind};
+use crate::{Event, EventKind, SCHEMA_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProcessKey {
@@ -151,6 +151,7 @@ impl Default for ProcessLifecycle {
 
 fn birth_event(key: &ProcessKey, rec: &ProcessRecord) -> Event {
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: rec.last_seen,
         kind: EventKind::ProcessBirth,
         pid: Some(key.pid),
@@ -167,6 +168,7 @@ fn birth_event(key: &ProcessKey, rec: &ProcessRecord) -> Event {
 
 fn death_event(key: &ProcessKey, rec: &ProcessRecord, now: Timestamp) -> Event {
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: now,
         kind: EventKind::ProcessDeath,
         pid: Some(key.pid),

@@ -193,6 +193,7 @@ dependencies = [
  "aw-network",
  "aw-process",
  "aw-scheduler",
+ "aw-store",
  "aw-system",
  "aw-window",
  "tokio",

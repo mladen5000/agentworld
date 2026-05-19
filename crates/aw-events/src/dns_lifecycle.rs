@@ -10,7 +10,7 @@
 use aw_core::Observation;
 use serde_json::json;
 
-use crate::{Event, EventKind};
+use crate::{Event, EventKind, SCHEMA_VERSION};
 
 pub struct DnsLifecycle;
 
@@ -33,6 +33,7 @@ impl DnsLifecycle {
         let client_process_name = p.get("client_process_name").and_then(|v| v.as_str()).map(String::from);
 
         vec![Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: obs.timestamp,
             kind: EventKind::DnsQuery,
             pid: obs.pid,

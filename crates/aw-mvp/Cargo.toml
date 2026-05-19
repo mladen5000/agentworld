@@ -24,6 +24,7 @@ aw-scheduler = { workspace = true }
 aw-system = { workspace = true }
 aw-window = { workspace = true }
 aw-agents = { workspace = true }
+aw-store = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

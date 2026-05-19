@@ -24,6 +24,8 @@ use std::collections::HashMap;
 
 use aw_core::{Observation, Timestamp};
 use aw_events::{Event, EventKind};
+#[cfg(test)]
+use aw_events::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 
 pub mod dot;
@@ -119,6 +121,12 @@ pub struct Graph {
 
 /// Streaming builder. Feed observations and events in arrival order; call
 /// `build()` at end-of-input to finalize and produce the `Graph`.
+///
+/// `Clone` is intentional: long-running consumers (the `aw-mvp` daemon) want
+/// to materialize a graph snapshot without consuming the builder, so they
+/// clone-and-build on each tick. Underlying state is `HashMap`s of plain
+/// data, so the clone is O(n) and avoids any unsafe sharing.
+#[derive(Clone)]
 pub struct GraphBuilder {
     processes: HashMap<ProcessId, ProcessNode>,
     /// Apps keyed by their canonical id (bundle_id or exec_path fallback).
@@ -380,6 +388,55 @@ impl GraphBuilder {
 
     /// Finalize and produce the graph. Open intervals are closed at the latest
     /// timestamp we've observed.
+    /// Materialize a `Graph` from the current builder state *without*
+    /// consuming the builder. Implemented by cloning then running `build`,
+    /// so the consumed builder closes its in-flight frontmost interval on a
+    /// throwaway copy and the original remains in a continuable state.
+    ///
+    /// Use this from long-running consumers that snapshot periodically
+    /// (e.g. the `aw-mvp` daemon merging into the store on each tick).
+    pub fn snapshot(&self) -> Graph {
+        self.clone().build()
+    }
+
+    /// Drop in-memory nodes that have been quiescent before `cutoff`. Returns
+    /// the number of nodes removed.
+    ///
+    /// Trim policy:
+    /// - Dead processes (`death = Some(d)` with `d < cutoff`) — gone for good
+    ///   from RAM; the persistent store retains them.
+    /// - Closed sockets (`closed = Some(c)` with `c < cutoff`) — same.
+    /// - Files whose `last_seen < cutoff` — fsevent paths accumulate fast and
+    ///   are the dominant unbounded growth in long-running daemons.
+    ///
+    /// Apps are *not* trimmed: they have low cardinality, stable identity,
+    /// and dropping the currently-frontmost app would corrupt the open
+    /// interval tracked in `current_frontmost`. Live processes and open
+    /// sockets are also left alone — there's nothing safe to drop yet.
+    ///
+    /// Re-introducing a trimmed entity later (e.g. a path touched again) is
+    /// safe: the store treats it as a new node with the same id and bumps
+    /// the merge count rather than duplicating.
+    pub fn trim_before(&mut self, cutoff: Timestamp) -> usize {
+        let cutoff_ns = cutoff.mono_ns;
+        let before_p = self.processes.len();
+        self.processes.retain(|_, p| match p.death {
+            Some(d) => d.mono_ns >= cutoff_ns,
+            None => true, // still alive
+        });
+        let before_s = self.sockets.len();
+        self.sockets.retain(|_, s| match s.closed {
+            Some(c) => c.mono_ns >= cutoff_ns,
+            None => true, // still open
+        });
+        let before_f = self.files.len();
+        self.files.retain(|_, f| f.last_seen.mono_ns >= cutoff_ns);
+
+        (before_p - self.processes.len())
+            + (before_s - self.sockets.len())
+            + (before_f - self.files.len())
+    }
+
     pub fn build(mut self) -> Graph {
         let end_ts = self.last_ts;
 
@@ -544,6 +601,7 @@ mod tests {
 
     fn birth(pid: u32, start: u64, comm: &str, ppid: u32, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::ProcessBirth,
             pid: Some(pid),
@@ -553,6 +611,7 @@ mod tests {
 
     fn death(pid: u32, start: u64, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::ProcessDeath,
             pid: Some(pid),
@@ -562,6 +621,7 @@ mod tests {
 
     fn conn_open(pid: u32, proto: &str, local: &str, foreign: &str, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::ConnectionOpened,
             pid: Some(pid),
@@ -575,6 +635,7 @@ mod tests {
 
     fn conn_close(pid: u32, proto: &str, local: &str, foreign: &str, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::ConnectionClosed,
             pid: Some(pid),
@@ -588,6 +649,7 @@ mod tests {
 
     fn file_changed(path: &str, flags: &[&str], count: u64, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::FileChanged,
             pid: None,
@@ -602,6 +664,7 @@ mod tests {
 
     fn focus(bundle: &str, name: &str, mono: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: ts(mono),
             kind: EventKind::AppFocus,
             pid: Some(999),
@@ -809,5 +872,47 @@ mod tests {
             })
             .collect();
         assert_eq!(edges, vec![1001], "should attach to the newer process");
+    }
+
+    #[test]
+    fn trim_before_drops_dead_processes_and_keeps_alive_ones() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&birth(100, 1, "alive", 1, 1_000));
+        b.on_event(&birth(200, 1, "dead", 1, 2_000));
+        b.on_event(&death(200, 1, 3_000));
+        // Cutoff at mono=2_500 — dead's death (3_000) is *after* cutoff, so it stays.
+        let trimmed = b.trim_before(ts(2_500));
+        assert_eq!(trimmed, 0, "no nodes old enough yet");
+        // Cutoff at mono=10_000 — dead is now strictly older than cutoff; alive is still alive.
+        let trimmed = b.trim_before(ts(10_000));
+        assert_eq!(trimmed, 1, "dead process should be trimmed");
+        let g = b.snapshot();
+        let pids: Vec<u32> = g.processes.iter().map(|p| p.id.pid).collect();
+        assert!(pids.contains(&100), "alive process must remain: {pids:?}");
+        assert!(!pids.contains(&200), "dead process must be gone: {pids:?}");
+    }
+
+    #[test]
+    fn trim_before_drops_files_quiescent_past_cutoff() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&file_changed("/tmp/old", &["modified"], 1, 1_000));
+        b.on_event(&file_changed("/tmp/recent", &["modified"], 1, 5_000));
+        let trimmed = b.trim_before(ts(3_000));
+        assert_eq!(trimmed, 1);
+        let g = b.snapshot();
+        let paths: Vec<&str> = g.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"/tmp/recent"));
+        assert!(!paths.contains(&"/tmp/old"));
+    }
+
+    #[test]
+    fn trim_before_keeps_open_sockets() {
+        let mut b = GraphBuilder::new();
+        // Only "opened" — never closed. Should always remain regardless of cutoff.
+        b.on_event(&conn_open(42, "tcp4", "10.0.0.1.50000", "1.2.3.4.443", 1_000));
+        let trimmed = b.trim_before(ts(1_000_000_000));
+        assert_eq!(trimmed, 0);
+        let g = b.snapshot();
+        assert_eq!(g.sockets.len(), 1, "open sockets must not be trimmed");
     }
 }

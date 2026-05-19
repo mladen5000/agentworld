@@ -36,14 +36,40 @@ pub mod window_lifecycle;
 use aw_core::{Observation, Source, Timestamp};
 use serde::{Deserialize, Serialize};
 
+/// Bumped on any breaking change to `Event` (new required field, removed field,
+/// renamed kind, restructured payload). Long-lived consumers (UIs, persistent
+/// stores, exporters) pin to this and reject or migrate older traces.
+///
+/// Bump rules:
+/// - Add a new optional payload field: no bump.
+/// - Add a new `EventKind` variant: no bump (consumers ignore unknown kinds).
+/// - Change the meaning, type, or required-ness of an existing field: bump.
+/// - Remove or rename a field: bump.
+pub const SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 { SCHEMA_VERSION }
+
 /// Canonical Layer 2 event. One event = one named, structured behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Self-identifies the event's schema. Set automatically by `Event::new`;
+    /// `serde` defaults it to the current `SCHEMA_VERSION` when deserializing
+    /// older traces written before this field existed.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub timestamp: Timestamp,
     pub kind: EventKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub payload: serde_json::Value,
+}
+
+impl Event {
+    /// Stamps `schema_version = SCHEMA_VERSION`. Use in preference to struct
+    /// literals so we have one place to revisit when the version bumps.
+    pub fn new(timestamp: Timestamp, kind: EventKind, pid: Option<u32>, payload: serde_json::Value) -> Self {
+        Self { schema_version: SCHEMA_VERSION, timestamp, kind, pid, payload }
+    }
 }
 
 /// Tagged kind. New variants go here; downstream consumers match on this.
@@ -329,5 +355,66 @@ mod enrich_tests {
         let entry = table.by_pid(500).expect("entry retained after death");
         assert!(!entry.alive, "should be marked dead");
         assert_eq!(entry.comm.as_deref(), Some("shortlived"));
+    }
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn emitted_events_carry_current_schema_version() {
+        let mut r = Reconstructor::new();
+        let one_sec = 1_000_000_000u64;
+        let obs = |mono: u64| Observation {
+            timestamp: Timestamp { mono_ns: mono, wall_anchor_ns: 0 },
+            source: Source::Process,
+            pid: Some(1),
+            payload: json!({
+                "comm": "launchd", "name": "launchd", "ppid": 0u32, "uid": 0u32,
+                "exec_path": "/sbin/launchd", "start_unix_secs": 100u64,
+            }),
+            tags: None,
+        };
+        // Three ticks so a birth fires (same priming dance as enrich_tests).
+        r.process(&obs(1));
+        r.process(&obs(one_sec + 1));
+        let events = r.process(&obs(2 * one_sec + 1));
+        // We don't care what fires here, only that *whatever* fires is stamped.
+        // If no event fires (process_lifecycle only tracks new pids), force one
+        // through the public Event::new constructor as a backstop.
+        let sample = events.into_iter().next().unwrap_or_else(|| {
+            Event::new(Timestamp { mono_ns: 0, wall_anchor_ns: 0 }, EventKind::FileChanged, None, json!({}))
+        });
+        assert_eq!(sample.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_events_without_field_deserialize_to_current_version() {
+        // A trace captured before schema_version existed: the field is absent.
+        // serde(default) must fill it with SCHEMA_VERSION, not panic.
+        let legacy = r#"{
+            "timestamp": {"mono_ns": 0, "wall_anchor_ns": 0},
+            "kind": "file_changed",
+            "payload": {"path": "/tmp/x", "flags": [], "event_ids": [], "count": 0, "first_seen": {"mono_ns":0,"wall_anchor_ns":0}, "last_seen": {"mono_ns":0,"wall_anchor_ns":0}}
+        }"#;
+        let ev: Event = serde_json::from_str(legacy).expect("legacy event deserializes");
+        assert_eq!(ev.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn round_trip_preserves_schema_version() {
+        let ev = Event::new(
+            Timestamp { mono_ns: 42, wall_anchor_ns: 7 },
+            EventKind::DnsQuery,
+            Some(1234),
+            json!({"qname": "example.com"}),
+        );
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"schema_version\":1"), "serialized form must include schema_version: {s}");
+        let back: Event = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.schema_version, SCHEMA_VERSION);
+        assert_eq!(back.pid, Some(1234));
     }
 }

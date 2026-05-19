@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use aw_core::{Observation, Timestamp};
 use serde_json::json;
 
-use crate::{Event, EventKind};
+use crate::{Event, EventKind, SCHEMA_VERSION};
 
 /// Coalescing window size. 500ms balances responsiveness against compression
 /// of editor-save bursts (which typically fire 4–6 events within ~10ms).
@@ -120,6 +120,7 @@ impl Default for FsEventsCoalesce {
 
 fn file_changed_event(path: &str, rec: &PathRecord, flush_ts: Timestamp) -> Event {
     Event {
+        schema_version: SCHEMA_VERSION,
         timestamp: flush_ts,
         kind: EventKind::FileChanged,
         pid: None,

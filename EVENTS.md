@@ -4,6 +4,7 @@ Canonical reference for every event kind emitted by `aw-events`. Each event has 
 
 ```json
 {
+  "schema_version": 1,
   "timestamp": { "mono_ns": <u64>, "wall_anchor_ns": <u128> },
   "kind": "<snake_case kind>",
   "pid": <u32 or omitted>,
@@ -11,11 +12,24 @@ Canonical reference for every event kind emitted by `aw-events`. Each event has 
 }
 ```
 
+`schema_version` self-identifies the event's schema. Current version: **1**. Consumers that persist events (UIs, stores, exporters) should pin to a known version and migrate or reject older traces explicitly. Events deserialized without this field (i.e. traces captured before the field existed) default to the current `SCHEMA_VERSION` at deserialize time — that default is a one-time bridge and should not be relied on by new consumers.
+
 `timestamp.mono_ns` is the offset (in nanoseconds) from `wall_anchor_ns` (a unix-epoch-nanoseconds anchor captured at process start). Subtracting two `mono_ns` values within one capture yields a duration that is immune to wall-clock adjustments. To recover absolute time, add: `wall_anchor_ns + mono_ns`.
 
 `pid` is the *primary acting entity* of the event when applicable. It is omitted for events that don't have one (e.g. `file_changed`).
 
 `payload` is event-kind-specific structured JSON. Field semantics are documented below.
+
+---
+
+## Schema versioning
+
+`schema_version` is bumped when consumers must change to keep working. Rules:
+
+- **No bump**: adding a new optional payload field; adding a new `EventKind` variant (consumers that don't recognize a kind should ignore it).
+- **Bump**: changing the meaning, type, or required-ness of an existing field; removing or renaming a field; restructuring nested payload objects (e.g. `process` enrichment).
+
+The constant lives at `aw_events::SCHEMA_VERSION`. Bump it in the same commit as the breaking change so the trace and the consumer stay in sync.
 
 ---
 

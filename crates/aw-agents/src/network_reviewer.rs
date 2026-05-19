@@ -11,6 +11,8 @@
 
 use anyhow::Result;
 use aw_events::{Event, EventKind};
+#[cfg(test)]
+use aw_events::SCHEMA_VERSION;
 use aw_llm::{Format, GenerateRequest, Options};
 use serde::{Deserialize, Serialize};
 
@@ -181,6 +183,7 @@ mod tests {
 
     fn completed(foreign: &str, process: &str, rx: u64, tx: u64, dur_ms: u64) -> Event {
         Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: Timestamp { mono_ns: 0, wall_anchor_ns: 0 },
             kind: EventKind::ConnectionCompleted,
             pid: Some(1),
@@ -249,6 +252,7 @@ mod tests {
         let mock = Arc::new(MockClient::new(vec![r#"{"summary":"x","findings":[]}"#]));
         let agent = NetworkReviewer::new(AgentCtx::new(mock.clone(), AgentConfig::default()));
         let evs = vec![Event {
+            schema_version: SCHEMA_VERSION,
             timestamp: Timestamp { mono_ns: 0, wall_anchor_ns: 0 },
             kind: EventKind::DnsQuery, // not Completed
             pid: None,

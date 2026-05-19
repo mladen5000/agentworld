@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  agentworld daemon LaunchAgent template.
+
+  This is a *template*. Replace the placeholders before installing:
+    __AW_MVP_BIN__   absolute path to the `aw-mvp` binary (e.g.
+                     /usr/local/bin/aw-mvp, or
+                     /Users/you/Projects/agentworld/target/release/aw-mvp)
+    __HOME__         absolute path to your home directory (e.g. /Users/you)
+
+  See dist/launchd/README.md for the recommended install procedure.
+
+  Notes on the chosen defaults:
+    * RunAtLoad + KeepAlive = start at login and restart on crash.
+    * ProcessType=Background = scheduled at lower priority; macOS will
+      throttle the process under thermal pressure.
+    * LowPriorityIO + Nice=10 = the daemon should never feel like it's
+      competing with the user's foreground work.
+    * StandardOut/Error go to ~/Library/Logs/agentworld/ so they survive
+      across daemon restarts and can be diffed when something looks wrong.
+    * --daemon is hard-coded; persistence and trim defaults are inherited
+      from the binary so the plist doesn't need touching to tune them.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentworld.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AW_MVP_BIN__</string>
+    <string>--daemon</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>Nice</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/agentworld/daemon.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/agentworld/daemon.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>RUST_LOG</key>
+    <string>warn,fsevent_stream=off</string>
+  </dict>
+</dict>
+</plist>
