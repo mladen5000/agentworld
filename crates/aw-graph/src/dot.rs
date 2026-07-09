@@ -1,19 +1,23 @@
 //! GraphViz DOT serializer.
 //!
-//! Renders a `Graph` as a `digraph` with four node shapes:
+//! Renders a `Graph` as a `digraph` with five node shapes:
 //!   - box       — process (color by uid: root red, user blue, other grey)
 //!   - ellipse   — app
 //!   - cylinder  — socket
 //!   - note      — file
+//!   - diamond   — domain
 //!
-//! Three edge styles:
+//! Four edge styles:
 //!   - solid black   — parent_of (process → process)
 //!   - dashed grey   — frontmost_during (app → process)
 //!   - solid green   — opened_socket (process → socket)
+//!   - dashed purple — queried_domain (process → domain)
 //!
 //! Exec paths and other detail go into tooltips, not labels — labels stay short.
 
-use crate::{Edge, Graph, ProcessId, ProcessNode, AppNode, SocketId, SocketNode, FileNode};
+use crate::{
+    AppNode, DomainNode, Edge, FileNode, Graph, ProcessId, ProcessNode, SocketId, SocketNode,
+};
 
 pub fn to_dot(graph: &Graph) -> String {
     let mut out = String::new();
@@ -34,6 +38,9 @@ pub fn to_dot(graph: &Graph) -> String {
     }
     for f in &graph.files {
         out.push_str(&file_node_line(f));
+    }
+    for d in &graph.domains {
+        out.push_str(&domain_node_line(d));
     }
     for e in &graph.edges {
         out.push_str(&edge_line(e));
@@ -78,7 +85,11 @@ fn socket_node_line(s: &SocketNode) -> String {
         s.id.foreign_addr,
         s.state.as_deref().unwrap_or("?"),
     ));
-    let color = if s.closed.is_some() { "#e6e6fa" } else { "#c6e6c6" };
+    let color = if s.closed.is_some() {
+        "#e6e6fa"
+    } else {
+        "#c6e6c6"
+    };
     format!(
         "  \"{id}\" [shape=cylinder, style=filled, fillcolor=\"{color}\", label=\"{label}\", tooltip=\"{tooltip}\"];\n"
     )
@@ -92,6 +103,24 @@ fn file_node_line(f: &FileNode) -> String {
     let tooltip = escape(&f.path);
     format!(
         "  \"{id}\" [shape=note, style=filled, fillcolor=\"#fde2c2\", label=\"{label}\", tooltip=\"{tooltip}\"];\n"
+    )
+}
+
+fn domain_node_line(d: &DomainNode) -> String {
+    let id = domain_dot_id(&d.name);
+    let label = escape(&d.name);
+    let tooltip = escape(&format!(
+        "{} queries ({})",
+        d.query_count,
+        if d.qtypes.is_empty() {
+            "?".to_string()
+        } else {
+            d.qtypes.join(",")
+        },
+    ));
+    let color = if d.masked { "#e0e0e0" } else { "#e2d5f8" };
+    format!(
+        "  \"{id}\" [shape=diamond, style=filled, fillcolor=\"{color}\", label=\"{label}\", tooltip=\"{tooltip}\"];\n"
     )
 }
 
@@ -116,6 +145,17 @@ fn edge_line(e: &Edge) -> String {
                 "  \"{}\" -> \"{}\" [color=\"#3a8a3a\"];\n",
                 process_dot_id(process),
                 socket_dot_id(socket),
+            )
+        }
+        Edge::QueriedDomain {
+            process,
+            domain,
+            count,
+        } => {
+            format!(
+                "  \"{}\" -> \"{}\" [style=dashed, color=\"#8a5fbf\", label=\"{count}\"];\n",
+                process_dot_id(process),
+                domain_dot_id(domain),
             )
         }
     }
@@ -144,6 +184,19 @@ fn file_dot_id(path: &str) -> String {
     let mut s = String::with_capacity(path.len() + 2);
     s.push_str("f_");
     for c in path.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+            s.push(c);
+        } else {
+            s.push('_');
+        }
+    }
+    s
+}
+
+fn domain_dot_id(name: &str) -> String {
+    let mut s = String::with_capacity(name.len() + 2);
+    s.push_str("d_");
+    for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
             s.push(c);
         } else {
@@ -183,9 +236,9 @@ fn escape(s: &str) -> String {
 
 fn uid_color(uid: Option<u32>) -> &'static str {
     match uid {
-        Some(0) => "#ffd0d0",   // root: red tint
+        Some(0) => "#ffd0d0",         // root: red tint
         Some(501..=600) => "#d0e6ff", // primary user range: blue tint
-        Some(_) => "#e8e8e8",   // other: grey
+        Some(_) => "#e8e8e8",         // other: grey
         None => "#f5f5f5",
     }
 }
@@ -193,15 +246,28 @@ fn uid_color(uid: Option<u32>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppNode, Edge, FileNode, Graph, Interval, ProcessId, ProcessNode, SocketId, SocketNode};
+    use crate::{
+        AppNode, Edge, FileNode, Graph, Interval, ProcessId, ProcessNode, SocketId, SocketNode,
+    };
     use aw_core::Timestamp;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
     #[test]
     fn renders_minimal_graph() {
-        let parent_id = ProcessId { pid: 1, start_unix_secs: 100 };
-        let child_id = ProcessId { pid: 200, start_unix_secs: 101 };
+        let parent_id = ProcessId {
+            pid: 1,
+            start_unix_secs: 100,
+        };
+        let child_id = ProcessId {
+            pid: 200,
+            start_unix_secs: 101,
+        };
         let g = Graph {
             processes: vec![
                 ProcessNode {
@@ -229,16 +295,26 @@ mod tests {
                 id: "com.apple.Terminal".into(),
                 name: Some("Terminal".into()),
                 exec_path: Some("/Applications/Terminal.app/Contents/MacOS/Terminal".into()),
-                intervals: vec![Interval { from: ts(15), to: None }],
+                intervals: vec![Interval {
+                    from: ts(15),
+                    to: None,
+                }],
             }],
             sockets: vec![],
             files: vec![],
+            domains: vec![],
             edges: vec![
-                Edge::ParentOf { parent: parent_id.clone(), child: child_id.clone() },
+                Edge::ParentOf {
+                    parent: parent_id.clone(),
+                    child: child_id.clone(),
+                },
                 Edge::FrontmostDuring {
                     app: "com.apple.Terminal".into(),
                     process: child_id.clone(),
-                    overlap: Interval { from: ts(20), to: None },
+                    overlap: Interval {
+                        from: ts(20),
+                        to: None,
+                    },
                 },
             ],
         };
@@ -259,7 +335,10 @@ mod tests {
 
     #[test]
     fn renders_sockets_files_and_opened_socket_edge() {
-        let proc_id = ProcessId { pid: 100, start_unix_secs: 1 };
+        let proc_id = ProcessId {
+            pid: 100,
+            start_unix_secs: 1,
+        };
         let sock_id = SocketId {
             proto: "tcp4".into(),
             local_addr: "10.0.0.1.50000".into(),
@@ -294,19 +373,89 @@ mod tests {
                 last_seen: ts(13),
                 touch_count: 2,
             }],
-            edges: vec![Edge::OpenedSocket { process: proc_id.clone(), socket: sock_id.clone() }],
+            domains: vec![],
+            edges: vec![Edge::OpenedSocket {
+                process: proc_id.clone(),
+                socket: sock_id.clone(),
+            }],
         };
         let dot = to_dot(&g);
-        assert!(dot.contains("shape=cylinder"), "missing cylinder for socket");
+        assert!(
+            dot.contains("shape=cylinder"),
+            "missing cylinder for socket"
+        );
         assert!(dot.contains("shape=note"), "missing note for file");
         assert!(dot.contains("output.txt"), "missing file basename");
-        assert!(dot.contains("\"p_100_1\" -> \"s_tcp4_"), "missing opened_socket edge: {dot}");
-        assert!(dot.contains("#3a8a3a"), "missing green color for opened_socket edge");
+        assert!(
+            dot.contains("\"p_100_1\" -> \"s_tcp4_"),
+            "missing opened_socket edge: {dot}"
+        );
+        assert!(
+            dot.contains("#3a8a3a"),
+            "missing green color for opened_socket edge"
+        );
+    }
+
+    #[test]
+    fn renders_domains_and_queried_domain_edge() {
+        let proc_id = ProcessId {
+            pid: 100,
+            start_unix_secs: 1,
+        };
+        let g = Graph {
+            processes: vec![ProcessNode {
+                id: proc_id.clone(),
+                comm: Some("curl".into()),
+                name: None,
+                exec_path: Some("/usr/bin/curl".into()),
+                ppid: None,
+                uid: Some(501),
+                birth: ts(10),
+                death: None,
+            }],
+            apps: vec![],
+            sockets: vec![],
+            files: vec![],
+            domains: vec![crate::DomainNode {
+                name: "example.com".into(),
+                qtypes: vec!["A".into(), "AAAA".into()],
+                masked: false,
+                first_seen: ts(11),
+                last_seen: ts(12),
+                query_count: 3,
+            }],
+            edges: vec![Edge::QueriedDomain {
+                process: proc_id.clone(),
+                domain: "example.com".into(),
+                count: 3,
+            }],
+        };
+        let dot = to_dot(&g);
+        assert!(
+            dot.contains("shape=diamond"),
+            "missing diamond for domain: {dot}"
+        );
+        assert!(dot.contains("\"d_example.com\""), "missing domain node id");
+        assert!(
+            dot.contains("\"p_100_1\" -> \"d_example.com\""),
+            "missing queried_domain edge"
+        );
+        assert!(
+            dot.contains("#8a5fbf"),
+            "missing purple queried_domain color"
+        );
+        assert!(
+            dot.contains("label=\"3\""),
+            "edge should carry the query count"
+        );
     }
 
     #[test]
     fn escapes_dangerous_chars_in_labels() {
-        let id = ProcessId { pid: 7, start_unix_secs: 1 };
+        let id = ProcessId {
+            pid: 7,
+            start_unix_secs: 1,
+        };
         let g = Graph {
             processes: vec![ProcessNode {
                 id,
@@ -321,6 +470,7 @@ mod tests {
             apps: vec![],
             sockets: vec![],
             files: vec![],
+            domains: vec![],
             edges: vec![],
         };
         let dot = to_dot(&g);

@@ -196,6 +196,7 @@ dependencies = [
  "aw-store",
  "aw-system",
  "aw-window",
+ "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -246,6 +247,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aw-events",
+ "aw-store",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aw-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -260,6 +273,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aw-core",
+ "aw-events",
  "aw-graph",
  "rusqlite",
  "serde",

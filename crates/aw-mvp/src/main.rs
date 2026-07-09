@@ -17,7 +17,7 @@
 //!   total in one-shot). Pipe-friendly.
 //! - `stderr`: status + tracing. Quiet by default; raise with `RUST_LOG`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use aw_agents::process_anomaly::ProcessAnomalyDetector;
 use aw_agents::timeline_narrator::TimelineNarrator;
 use aw_agents::{AgentConfig, AgentCtx};
-use aw_core::{Bus, MonotonicClock};
+use aw_core::{Bus, MonotonicClock, Source};
 use aw_dns::DnsAdapter;
 use aw_eslogger::EsLoggerAdapter;
 use aw_events::{Event, Reconstructor};
@@ -61,6 +61,12 @@ struct Args {
     /// Daemon: how stale an in-memory node can be before being dropped (after
     /// it's been persisted to the store). Caps RAM growth on long runs.
     store_ttl: Duration,
+    /// Skip every LLM call: the daemon becomes a pure collector, one-shot
+    /// just captures and persists. No Ollama required.
+    no_narrate: bool,
+    /// Daemon: delete store rows quiescent for longer than this many days,
+    /// checked once per hour. 0 disables self-pruning.
+    retention_days: u64,
 }
 
 impl Default for Args {
@@ -75,6 +81,8 @@ impl Default for Args {
             store_path: None,
             no_store: false,
             store_ttl: Duration::from_secs(60 * 60), // 1 hour
+            no_narrate: false,
+            retention_days: 30,
         }
     }
 }
@@ -93,7 +101,9 @@ fn default_store_path() -> Option<PathBuf> {
 /// Apply `--no-store` / `--store-path` / default to produce the path we should
 /// use, or `None` if persistence is disabled / unresolvable.
 fn resolve_store_path(args: &Args) -> Option<PathBuf> {
-    if args.no_store { return None; }
+    if args.no_store {
+        return None;
+    }
     args.store_path.clone().or_else(default_store_path)
 }
 
@@ -104,8 +114,8 @@ fn open_store(path: PathBuf) -> Result<(Store, PathBuf)> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating store directory {}", dir.display()))?;
     }
-    let store = Store::open(&path)
-        .with_context(|| format!("opening store at {}", path.display()))?;
+    let store =
+        Store::open(&path).with_context(|| format!("opening store at {}", path.display()))?;
     Ok((store, path))
 }
 
@@ -115,30 +125,62 @@ fn parse_args() -> Result<Args> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--duration" => {
-                let v = iter.next().context("--duration requires a value (seconds)")?;
-                args.duration = Duration::from_secs(v.parse().context("--duration must be an integer number of seconds")?);
+                let v = iter
+                    .next()
+                    .context("--duration requires a value (seconds)")?;
+                args.duration = Duration::from_secs(
+                    v.parse()
+                        .context("--duration must be an integer number of seconds")?,
+                );
             }
             "--daemon" => args.daemon = true,
             "--tick" => {
                 let v = iter.next().context("--tick requires a value (seconds)")?;
-                args.tick = Duration::from_secs(v.parse().context("--tick must be an integer number of seconds")?);
+                args.tick = Duration::from_secs(
+                    v.parse()
+                        .context("--tick must be an integer number of seconds")?,
+                );
             }
             "--window" => {
                 let v = iter.next().context("--window requires a value (seconds)")?;
-                args.window = Duration::from_secs(v.parse().context("--window must be an integer number of seconds")?);
+                args.window = Duration::from_secs(
+                    v.parse()
+                        .context("--window must be an integer number of seconds")?,
+                );
             }
             "--model" => args.model = iter.next().context("--model requires a value")?,
-            "--ollama-url" => args.ollama_url = iter.next().context("--ollama-url requires a value")?,
+            "--ollama-url" => {
+                args.ollama_url = iter.next().context("--ollama-url requires a value")?
+            }
             "--store-path" => {
                 let v = iter.next().context("--store-path requires a value")?;
                 args.store_path = Some(PathBuf::from(v));
             }
             "--no-store" => args.no_store = true,
-            "--store-ttl" => {
-                let v = iter.next().context("--store-ttl requires a value (seconds)")?;
-                args.store_ttl = Duration::from_secs(v.parse().context("--store-ttl must be an integer number of seconds")?);
+            "--no-narrate" => args.no_narrate = true,
+            "--retention-days" => {
+                let v = iter.next().context("--retention-days requires a value")?;
+                args.retention_days = v
+                    .parse()
+                    .context("--retention-days must be an integer (0 disables)")?;
             }
-            "-h" | "--help" => { print_usage(); std::process::exit(0); }
+            "--print-launchd-plist" => {
+                print_launchd_plist();
+                std::process::exit(0);
+            }
+            "--store-ttl" => {
+                let v = iter
+                    .next()
+                    .context("--store-ttl requires a value (seconds)")?;
+                args.store_ttl = Duration::from_secs(
+                    v.parse()
+                        .context("--store-ttl must be an integer number of seconds")?,
+                );
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
@@ -149,7 +191,8 @@ fn parse_args() -> Result<Args> {
         eprintln!(
             "aw-mvp: warning — --tick ({tick}s) is longer than --window ({window}s); \
              each paragraph will only ever see a fraction of the captured activity.",
-            tick = args.tick.as_secs(), window = args.window.as_secs(),
+            tick = args.tick.as_secs(),
+            window = args.window.as_secs(),
         );
     }
     Ok(args)
@@ -157,8 +200,9 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     eprintln!("usage: aw-mvp [--daemon] [--duration <secs>] [--tick <secs>] [--window <secs>]");
-    eprintln!("              [--model <name>] [--ollama-url <url>]");
-    eprintln!("              [--store-path <path> | --no-store]");
+    eprintln!("              [--model <name>] [--ollama-url <url>] [--no-narrate]");
+    eprintln!("              [--store-path <path> | --no-store] [--retention-days <n>]");
+    eprintln!("              [--print-launchd-plist]");
     eprintln!();
     eprintln!("One-shot mode (default): captures for --duration seconds, narrates");
     eprintln!("once, runs an anomaly pass, exits.");
@@ -175,10 +219,65 @@ fn print_usage() {
     eprintln!("quiescent for longer than the TTL (default 3600s) after each merge.");
     eprintln!("The store keeps them — trimming only caps RAM use on long runs.");
     eprintln!();
+    eprintln!("--no-narrate skips every LLM call (pure collector; no Ollama needed).");
+    eprintln!();
+    eprintln!("Daemon retention: rows quiescent for --retention-days (default 30)");
+    eprintln!("are pruned from the store once per hour. 0 disables.");
+    eprintln!();
+    eprintln!("--print-launchd-plist writes a LaunchAgent plist to stdout:");
+    eprintln!(
+        "  aw-mvp --print-launchd-plist > ~/Library/LaunchAgents/com.agentworld.aw-mvp.plist"
+    );
+    eprintln!("  launchctl load ~/Library/LaunchAgents/com.agentworld.aw-mvp.plist");
+    eprintln!();
     eprintln!("Defaults: --duration 30 --tick 60 --window 300 --model gemma3:4b");
     eprintln!("          --ollama-url http://127.0.0.1:11434");
     eprintln!();
-    eprintln!("Ctrl-C stops cleanly in both modes.");
+    eprintln!("Ctrl-C or SIGTERM stops cleanly in both modes.");
+}
+
+/// Emit a launchd LaunchAgent plist for running the daemon as a background
+/// service, using the currently-running binary's path. Written to stdout so
+/// the user can inspect before installing; instructions go to stderr.
+fn print_launchd_plist() {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/aw-mvp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    println!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentworld.aw-mvp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>--daemon</string>
+        <string>--no-narrate</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>{home}/Library/Logs/agentworld/aw-mvp.log</string>
+    <key>StandardErrorPath</key>
+    <string>{home}/Library/Logs/agentworld/aw-mvp.err.log</string>
+</dict>
+</plist>"#
+    );
+    eprintln!();
+    eprintln!("aw-mvp: install with:");
+    eprintln!("  mkdir -p ~/Library/Logs/agentworld");
+    eprintln!(
+        "  aw-mvp --print-launchd-plist > ~/Library/LaunchAgents/com.agentworld.aw-mvp.plist"
+    );
+    eprintln!("  launchctl load ~/Library/LaunchAgents/com.agentworld.aw-mvp.plist");
+    eprintln!("(drop --no-narrate from the plist if Ollama runs at login and you want narration)");
 }
 
 #[tokio::main]
@@ -195,7 +294,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
-    if args.daemon { run_daemon(args).await } else { run_one_shot(args).await }
+    if args.daemon {
+        run_daemon(args).await
+    } else {
+        run_one_shot(args).await
+    }
 }
 
 // ============================================================================
@@ -205,48 +308,78 @@ async fn main() -> Result<()> {
 async fn run_one_shot(args: Args) -> Result<()> {
     eprintln!(
         "aw-mvp: capturing for {}s; model={} url={}",
-        args.duration.as_secs(), args.model, args.ollama_url,
+        args.duration.as_secs(),
+        args.model,
+        args.ollama_url,
     );
 
-    let events = capture_for_duration(args.duration).await?;
-    eprintln!("aw-mvp: capture done — {} reconstructed events", events.len());
-
-    let llm = Arc::new(OllamaClient::with_base_url(&args.ollama_url));
-    let make_ctx = || AgentCtx::new(
-        llm.clone(),
-        AgentConfig { model: args.model.clone(), ..AgentConfig::default() },
+    let (events, source_counts) = capture_for_duration(args.duration).await?;
+    eprintln!(
+        "aw-mvp: capture done — {} reconstructed events",
+        events.len()
     );
-
-    eprintln!("aw-mvp: asking {} to narrate...", args.model);
-    let narrative = TimelineNarrator::new(make_ctx())
-        .run(&events)
-        .await
-        .context("timeline narrator failed (is Ollama running and the model pulled?)")?;
-    println!("{}", narrative.summary);
+    report_capture_health("aw-mvp", &source_counts);
 
     let graph = build_graph(&events);
 
-    // Persist the graph before the anomaly pass so a crash or Ctrl-C during
-    // narration doesn't lose the capture. `merge_graph` is idempotent: re-run
-    // produces no duplicates, just bumps edge counts.
+    // Persist the capture (graph + event history) BEFORE any LLM call so an
+    // unreachable or slow model can't lose it. `merge_graph` is idempotent:
+    // re-run produces no duplicates, just bumps edge counts.
     if let Some(path) = resolve_store_path(&args) {
         match open_store(path) {
-            Ok((mut store, p)) => match store.merge_graph(&graph) {
-                Ok(report) => eprintln!(
-                    "aw-mvp: persisted to {} (nodes +{}/{}, edges +{}/{})",
-                    p.display(),
-                    report.nodes_inserted, report.nodes_updated,
-                    report.edges_inserted, report.edges_updated,
-                ),
-                Err(e) => eprintln!("aw-mvp: store merge failed: {e}"),
-            },
+            Ok((mut store, p)) => {
+                match store.merge_graph(&graph) {
+                    Ok(report) => eprintln!(
+                        "aw-mvp: persisted to {} (nodes +{}/{}, edges +{}/{})",
+                        p.display(),
+                        report.nodes_inserted,
+                        report.nodes_updated,
+                        report.edges_inserted,
+                        report.edges_updated,
+                    ),
+                    Err(e) => eprintln!("aw-mvp: store merge failed: {e}"),
+                }
+                if !events.is_empty() {
+                    match store.append_events(&events) {
+                        Ok(n) => eprintln!("aw-mvp: appended {n} events to history"),
+                        Err(e) => eprintln!("aw-mvp: event append failed: {e}"),
+                    }
+                }
+            }
             Err(e) => eprintln!("aw-mvp: could not open store: {e}"),
+        }
+    }
+
+    if args.no_narrate {
+        eprintln!("aw-mvp: --no-narrate — skipping narration and anomaly passes");
+        return Ok(());
+    }
+
+    let llm = Arc::new(OllamaClient::with_base_url(&args.ollama_url));
+    let make_ctx = || {
+        AgentCtx::new(
+            llm.clone(),
+            AgentConfig {
+                model: args.model.clone(),
+                ..AgentConfig::default()
+            },
+        )
+    };
+
+    // The capture is already durable; from here on LLM failures only cost
+    // narration, never data.
+    eprintln!("aw-mvp: asking {} to narrate...", args.model);
+    match TimelineNarrator::new(make_ctx()).run(&events).await {
+        Ok(narrative) => println!("{}", narrative.summary),
+        Err(e) => {
+            eprintln!("aw-mvp: narration failed (is Ollama running and the model pulled?): {e}")
         }
     }
 
     eprintln!(
         "aw-mvp: anomaly pass over {} processes, {} edges...",
-        graph.processes.len(), graph.edges.len(),
+        graph.processes.len(),
+        graph.edges.len(),
     );
     match ProcessAnomalyDetector::new(make_ctx()).run(&graph).await {
         Ok(report) => {
@@ -261,36 +394,135 @@ async fn run_one_shot(args: Args) -> Result<()> {
 
 fn build_graph(events: &[Event]) -> aw_graph::Graph {
     let mut builder = GraphBuilder::new();
-    for ev in events { builder.on_event(ev); }
+    for ev in events {
+        builder.on_event(ev);
+    }
     builder.build()
 }
 
-async fn capture_for_duration(duration: Duration) -> Result<Vec<Event>> {
+async fn capture_for_duration(duration: Duration) -> Result<(Vec<Event>, HashMap<Source, u64>)> {
     let clock = Arc::new(MonotonicClock::new());
     let (bus, mut rx) = Bus::channel();
     let mut scheduler = build_scheduler(clock.clone(), bus.clone());
     let mut recon = Reconstructor::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut source_counts: HashMap<Source, u64> = HashMap::new();
     let deadline = tokio::time::sleep(duration);
     tokio::pin!(deadline);
 
     loop {
         tokio::select! {
             biased;
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("aw-mvp: Ctrl-C — finishing early");
+            signal = shutdown_signal() => {
+                eprintln!("aw-mvp: {signal} — finishing early");
                 break;
             }
             _ = &mut deadline => break,
             maybe = rx.recv() => match maybe {
-                Some(obs) => { for ev in recon.process(&obs) { events.push(ev); } }
+                Some(obs) => {
+                    *source_counts.entry(obs.source).or_insert(0) += 1;
+                    for ev in recon.process(&obs) { events.push(ev); }
+                }
                 None => break,
             },
         }
     }
 
     scheduler.shutdown();
-    Ok(events)
+    Ok((events, source_counts))
+}
+
+/// Every Layer 1 source category, with its snake_case display name. Used to
+/// spot sources that produced *nothing* — on macOS that usually means a
+/// missing permission, not a quiet system.
+const ALL_SOURCES: [(&str, Source); 5] = [
+    ("file_system", Source::FileSystem),
+    ("process", Source::Process),
+    ("network", Source::Network),
+    ("window", Source::Window),
+    ("system", Source::System),
+];
+
+/// One stderr line of per-source observation counts, plus a warning naming
+/// any source that stayed completely silent.
+fn report_capture_health(prefix: &str, counts: &HashMap<Source, u64>) {
+    let mut parts = Vec::new();
+    let mut silent = Vec::new();
+    for (name, src) in ALL_SOURCES {
+        let n = counts.get(&src).copied().unwrap_or(0);
+        if n == 0 {
+            silent.push(name);
+        }
+        parts.push(format!("{name}={n}"));
+    }
+    eprintln!("{prefix}: source health: {}", parts.join(" "));
+    if !silent.is_empty() {
+        eprintln!(
+            "{prefix}: warning — no observations from: {}. On macOS this usually \
+             means a missing permission (Window needs Accessibility for the \
+             frontmost-app poll; Endpoint Security events need sudo).",
+            silent.join(", "),
+        );
+    }
+}
+
+/// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or SIGTERM
+/// (launchd / `kill`). Returns the signal name for logging. SIGTERM matters
+/// for daemon use — launchd stops services with it, and without a handler
+/// the final store merge would be lost.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // Registration only fails in exotic environments; degrade to
+            // Ctrl-C-only rather than refusing to run.
+            tracing::warn!("aw-mvp: SIGTERM handler unavailable ({e}); handling Ctrl-C only");
+            let _ = tokio::signal::ctrl_c().await;
+            return "Ctrl-C";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Ctrl-C",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+/// Advisory single-instance lock next to the store. Two daemons appending to
+/// the same `world.db` would duplicate event history, so the second refuses
+/// to start. `flock` is released by the kernel when the process exits —
+/// including on crash — so there are no stale locks to clean up.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+fn acquire_instance_lock(store_path: &std::path::Path) -> Result<InstanceLock> {
+    use std::os::fd::AsRawFd;
+    let lock_path = store_path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("creating lock file {}", lock_path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        anyhow::bail!(
+            "another aw-mvp daemon is already writing {} (lock {} is held); \
+             stop it first or use a different --store-path",
+            store_path.display(),
+            lock_path.display(),
+        );
+    }
+    Ok(InstanceLock { _file: file })
+}
+
+/// Wall-clock now in unix nanoseconds — the encoding the store uses.
+fn now_unix_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 // ============================================================================
@@ -300,9 +532,28 @@ async fn capture_for_duration(duration: Duration) -> Result<Vec<Event>> {
 async fn run_daemon(args: Args) -> Result<()> {
     eprintln!(
         "aw-mvp: daemon mode — tick={}s window={}s model={} url={}",
-        args.tick.as_secs(), args.window.as_secs(), args.model, args.ollama_url,
+        args.tick.as_secs(),
+        args.window.as_secs(),
+        args.model,
+        args.ollama_url,
     );
-    eprintln!("aw-mvp: Ctrl-C to stop. First paragraph in ~{}s.", args.tick.as_secs());
+    if args.no_narrate {
+        eprintln!("aw-mvp: collector mode (--no-narrate) — no LLM calls will be made");
+    } else {
+        eprintln!(
+            "aw-mvp: Ctrl-C or SIGTERM to stop. First paragraph in ~{}s.",
+            args.tick.as_secs()
+        );
+    }
+
+    // Refuse to run two daemons against the same store: the event history
+    // table has no dedup, so concurrent writers would double every event.
+    // The lock is advisory and kernel-released on exit or crash. Held for
+    // the daemon's whole lifetime.
+    let _instance_lock: Option<InstanceLock> = match resolve_store_path(&args) {
+        Some(path) => Some(acquire_instance_lock(&path)?),
+        None => None,
+    };
 
     let clock = Arc::new(MonotonicClock::new());
     let (bus, mut rx) = Bus::channel();
@@ -315,32 +566,49 @@ async fn run_daemon(args: Args) -> Result<()> {
     let mut window: VecDeque<Event> = VecDeque::new();
     let window_ns = args.window.as_nanos() as u64;
 
+    // Events accumulated since the last successful store append; flushed to
+    // the durable history table on each tick. Independent of `window`, which
+    // evicts by age for the narrator.
+    let mut pending_events: Vec<Event> = Vec::new();
+    // Per-tick observation counts for the source-health line.
+    let mut tick_sources: HashMap<Source, u64> = HashMap::new();
+
     // Persistent store + in-flight graph builder. The window above feeds the
     // *narrator*; this builder feeds the *store*. They're separate because the
     // narration is short-lived (one paragraph per tick) while the store is the
     // long-lived durable mirror.
-    let mut store_and_builder: Option<(Store, GraphBuilder, PathBuf)> = match resolve_store_path(&args) {
-        Some(path) => match open_store(path) {
-            Ok((store, p)) => {
-                eprintln!("aw-mvp: persisting to {}", p.display());
-                Some((store, GraphBuilder::new(), p))
-            }
-            Err(e) => {
-                eprintln!("aw-mvp: persistence disabled — could not open store: {e}");
+    let mut store_and_builder: Option<(Store, GraphBuilder, PathBuf)> =
+        match resolve_store_path(&args) {
+            Some(path) => match open_store(path) {
+                Ok((store, p)) => {
+                    eprintln!("aw-mvp: persisting to {}", p.display());
+                    // Heartbeat: pid + start time, refreshed every tick, so
+                    // `aw-query summary` can say whether a daemon is alive.
+                    let _ = store.set_meta("daemon_pid", &std::process::id().to_string());
+                    let _ = store.set_meta("daemon_heartbeat_unix_ns", &now_unix_ns().to_string());
+                    Some((store, GraphBuilder::new(), p))
+                }
+                Err(e) => {
+                    eprintln!("aw-mvp: persistence disabled — could not open store: {e}");
+                    None
+                }
+            },
+            None => {
+                eprintln!("aw-mvp: persistence disabled (--no-store or $HOME unset)");
                 None
             }
-        },
-        None => {
-            eprintln!("aw-mvp: persistence disabled (--no-store or $HOME unset)");
-            None
-        }
-    };
+        };
 
     let llm = Arc::new(OllamaClient::with_base_url(&args.ollama_url));
-    let make_ctx = || AgentCtx::new(
-        llm.clone(),
-        AgentConfig { model: args.model.clone(), ..AgentConfig::default() },
-    );
+    let make_ctx = || {
+        AgentCtx::new(
+            llm.clone(),
+            AgentConfig {
+                model: args.model.clone(),
+                ..AgentConfig::default()
+            },
+        )
+    };
 
     let mut ticker = tokio::time::interval(args.tick);
     // First tick fires immediately by default; skip it so the first paragraph
@@ -353,11 +621,17 @@ async fn run_daemon(args: Args) -> Result<()> {
     // and skip rather than queue. `None` means "no narration running".
     let mut narrating: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Self-pruning: at most once per hour, delete store rows quiescent for
+    // longer than --retention-days. `None` means "not yet pruned this run" —
+    // the first tick prunes immediately so restarts don't defer cleanup.
+    let mut last_prune: Option<std::time::Instant> = None;
+    let retention_ns = (args.retention_days as i64) * 86_400 * 1_000_000_000;
+
     loop {
         tokio::select! {
             biased;
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("aw-mvp: Ctrl-C — stopping daemon");
+            signal = shutdown_signal() => {
+                eprintln!("aw-mvp: {signal} — stopping daemon");
                 break;
             }
             _ = ticker.tick() => {
@@ -398,8 +672,47 @@ async fn run_daemon(args: Args) -> Result<()> {
                         }
                         Err(e) => eprintln!("aw-mvp: store merge failed: {e}"),
                     }
+                    // Flush the event history. On failure the batch is
+                    // dropped with a warning rather than retried — drop is
+                    // preferred over unbounded buffering (same philosophy as
+                    // the Layer 1 bus).
+                    if !pending_events.is_empty() {
+                        match store.append_events(&pending_events) {
+                            Ok(n) => eprintln!("aw-mvp: appended {n} events to history"),
+                            Err(e) => eprintln!(
+                                "aw-mvp: event append failed; dropping {} events: {e}",
+                                pending_events.len(),
+                            ),
+                        }
+                        pending_events.clear();
+                    }
+
+                    // Heartbeat + hourly retention pass.
+                    let _ = store.set_meta("daemon_heartbeat_unix_ns", &now_unix_ns().to_string());
+                    let prune_due = args.retention_days > 0
+                        && last_prune.map(|t| t.elapsed() >= Duration::from_secs(3600)).unwrap_or(true);
+                    if prune_due {
+                        last_prune = Some(std::time::Instant::now());
+                        let cutoff = now_unix_ns().saturating_sub(retention_ns);
+                        match store.prune_before(cutoff) {
+                            Ok(r) if r.nodes_deleted + r.edges_deleted + r.events_deleted > 0 => {
+                                eprintln!(
+                                    "aw-mvp: retention pruned {} nodes, {} edges, {} events older than {}d",
+                                    r.nodes_deleted, r.edges_deleted, r.events_deleted, args.retention_days,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("aw-mvp: retention prune failed: {e}"),
+                        }
+                    }
                 }
 
+                report_capture_health("aw-mvp", &tick_sources);
+                tick_sources.clear();
+
+                if args.no_narrate {
+                    continue;
+                }
                 if window.is_empty() {
                     eprintln!("aw-mvp: window empty — nothing to narrate yet");
                     continue;
@@ -428,6 +741,7 @@ async fn run_daemon(args: Args) -> Result<()> {
             }
             maybe = rx.recv() => match maybe {
                 Some(obs) => {
+                    *tick_sources.entry(obs.source).or_insert(0) += 1;
                     // Also feed the raw observation to the graph builder so
                     // app-focus intervals (which derive from `Window` source
                     // observations, not Layer 2 events) get captured.
@@ -437,6 +751,9 @@ async fn run_daemon(args: Args) -> Result<()> {
                     for ev in recon.process(&obs) {
                         if let Some((_, builder, _)) = store_and_builder.as_mut() {
                             builder.on_event(&ev);
+                        }
+                        if store_and_builder.is_some() {
+                            pending_events.push(ev.clone());
                         }
                         window.push_back(ev);
                     }
@@ -467,11 +784,23 @@ async fn run_daemon(args: Args) -> Result<()> {
             Ok(report) => eprintln!(
                 "aw-mvp: final merge to {} (nodes +{}/{}, edges +{}/{})",
                 path.display(),
-                report.nodes_inserted, report.nodes_updated,
-                report.edges_inserted, report.edges_updated,
+                report.nodes_inserted,
+                report.nodes_updated,
+                report.edges_inserted,
+                report.edges_updated,
             ),
             Err(e) => eprintln!("aw-mvp: final store merge failed: {e}"),
         }
+        if !pending_events.is_empty() {
+            match store.append_events(&pending_events) {
+                Ok(n) => eprintln!("aw-mvp: appended final {n} events to history"),
+                Err(e) => eprintln!("aw-mvp: final event append failed: {e}"),
+            }
+        }
+        // Clear the pid so `aw-query summary` reports a clean stop instead
+        // of a stale-looking heartbeat. Crashes skip this — that's exactly
+        // the case where a stale heartbeat is the honest signal.
+        let _ = store.set_meta("daemon_pid", "");
     }
 
     // Give an in-flight narration up to 5s to finish so its paragraph

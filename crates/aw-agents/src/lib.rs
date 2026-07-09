@@ -1,12 +1,13 @@
 //! Agents that consume Layer 2 events and Layer 3 graphs and produce
 //! human-readable analyses via a local LLM.
 //!
-//! Three concrete agents live here:
+//! Four concrete agents live here:
 //!
 //! - [`timeline_narrator::TimelineNarrator`] — chronological prose summary.
 //! - [`process_anomaly::ProcessAnomalyDetector`] — flags suspicious processes
 //!   by lineage / name / uid.
 //! - [`network_reviewer::NetworkReviewer`] — flags notable network conversations.
+//! - [`dns_reviewer::DnsReviewer`] — flags notable DNS names and query patterns.
 //!
 //! All agents share a [`Report`] return shape and use the
 //! [`aw_llm::LlmClient`] trait, so tests can supply a mock and never need a
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use aw_llm::LlmClient;
 use serde::{Deserialize, Serialize};
 
+pub mod dns_reviewer;
 pub mod input;
 pub mod network_reviewer;
 pub mod process_anomaly;

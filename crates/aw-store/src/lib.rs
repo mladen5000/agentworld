@@ -15,8 +15,10 @@
 use std::path::Path;
 
 use aw_core::Timestamp;
+use aw_events::{Event, EventKind};
 use aw_graph::{
-    AppNode, Edge, FileNode, Graph, Interval, ProcessId, ProcessNode, SocketId, SocketNode,
+    AppNode, DomainNode, Edge, FileNode, Graph, Interval, ProcessId, ProcessNode, SocketId,
+    SocketNode,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -67,6 +69,18 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_to        ON edges(to_kind, to_id);
 CREATE INDEX IF NOT EXISTS idx_edges_last_seen ON edges(last_seen);
+
+CREATE TABLE IF NOT EXISTS events (
+    id             INTEGER PRIMARY KEY,
+    ts_unix_ns     INTEGER NOT NULL,
+    kind           TEXT    NOT NULL,
+    pid            INTEGER,
+    schema_version INTEGER NOT NULL,
+    payload        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_ts      ON events(ts_unix_ns);
+CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts_unix_ns);
 "#;
 
 /// One row of [`Store::top_endpoints_by_bytes`]. Fields are derived from
@@ -96,6 +110,43 @@ pub struct FocusSegment {
     pub duration_secs: u64,
 }
 
+/// One row of [`Store::top_domains`]. Query counts come from the domain
+/// node's attrs (highest observed tally per merge); distinct processes from
+/// `queried_domain` edges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSummary {
+    pub name: String,
+    pub query_count: u64,
+    pub distinct_processes: u32,
+    pub last_seen_unix_ns: i64,
+}
+
+/// Result of [`Store::prune_before`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PruneReport {
+    pub nodes_deleted: u64,
+    pub edges_deleted: u64,
+    #[serde(default)]
+    pub events_deleted: u64,
+}
+
+/// Result of [`Store::summary`]: per-kind row counts plus the wall-clock
+/// span the store covers.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StoreSummary {
+    /// `(node kind, row count)`, descending by count.
+    pub node_counts: Vec<(String, u64)>,
+    /// `(edge kind, row count)`, descending by count.
+    pub edge_counts: Vec<(String, u64)>,
+    /// Earliest `first_seen` across all nodes (unix ns); `None` if empty.
+    pub first_seen_unix_ns: Option<i64>,
+    /// Latest `last_seen` across all nodes (unix ns); `None` if empty.
+    pub last_seen_unix_ns: Option<i64>,
+    /// Rows in the `events` history table.
+    #[serde(default)]
+    pub event_count: u64,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MergeReport {
     pub nodes_inserted: u64,
@@ -122,6 +173,12 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // WAL lets the aw-mvp daemon keep writing while aw-query reads the
+        // same file; the busy timeout absorbs the brief write locks that
+        // remain. In-memory databases don't support WAL — the pragma then
+        // returns "memory", which is fine, so the result value is ignored.
+        let _: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA_SQL)?;
         // Record the schema version if not already present.
         let current: Option<String> = conn
@@ -153,6 +210,32 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Set an operational metadata key (e.g. the daemon's heartbeat). The
+    /// `schema_version` key is owned by `init` and rejected here so a caller
+    /// can't accidentally break migration checks.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        if key == "schema_version" {
+            return Err(StoreError::Migration(
+                "schema_version is managed by the store itself".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     pub fn schema_version(&self) -> Result<i32> {
         let s: String = self.conn.query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",
@@ -181,7 +264,15 @@ impl Store {
                 "start_unix_secs": p.id.start_unix_secs,
                 "death": p.death,
             }))?;
-            upsert_node(&tx, kind, &id, &attrs, p.birth, p.death.unwrap_or(p.birth), &mut report)?;
+            upsert_node(
+                &tx,
+                kind,
+                &id,
+                &attrs,
+                p.birth,
+                p.death.unwrap_or(p.birth),
+                &mut report,
+            )?;
         }
 
         for a in &g.apps {
@@ -192,8 +283,21 @@ impl Store {
                 "exec_path": a.exec_path,
                 "intervals": a.intervals,
             }))?;
-            let first_seen = a.intervals.iter().map(|i| i.from).min().unwrap_or(Timestamp { mono_ns: 0, wall_anchor_ns: 0 });
-            let last_seen = a.intervals.iter().filter_map(|i| i.to).max().unwrap_or(first_seen);
+            let first_seen = a
+                .intervals
+                .iter()
+                .map(|i| i.from)
+                .min()
+                .unwrap_or(Timestamp {
+                    mono_ns: 0,
+                    wall_anchor_ns: 0,
+                });
+            let last_seen = a
+                .intervals
+                .iter()
+                .filter_map(|i| i.to)
+                .max()
+                .unwrap_or(first_seen);
             upsert_node(&tx, kind, id, &attrs, first_seen, last_seen, &mut report)?;
         }
 
@@ -210,7 +314,15 @@ impl Store {
                 "local_addr": s.id.local_addr,
                 "foreign_addr": s.id.foreign_addr,
             }))?;
-            upsert_node(&tx, kind, &id, &attrs, s.opened, s.closed.unwrap_or(s.opened), &mut report)?;
+            upsert_node(
+                &tx,
+                kind,
+                &id,
+                &attrs,
+                s.opened,
+                s.closed.unwrap_or(s.opened),
+                &mut report,
+            )?;
         }
 
         for f in &g.files {
@@ -220,7 +332,34 @@ impl Store {
                 "flags": f.flags,
                 "touch_count": f.touch_count,
             }))?;
-            upsert_node(&tx, kind, id, &attrs, f.first_seen, f.last_seen, &mut report)?;
+            upsert_node(
+                &tx,
+                kind,
+                id,
+                &attrs,
+                f.first_seen,
+                f.last_seen,
+                &mut report,
+            )?;
+        }
+
+        for d in &g.domains {
+            let kind = "domain";
+            let id = &d.name;
+            let attrs = serde_json::to_string(&serde_json::json!({
+                "qtypes": d.qtypes,
+                "masked": d.masked,
+                "query_count": d.query_count,
+            }))?;
+            upsert_node(
+                &tx,
+                kind,
+                id,
+                &attrs,
+                d.first_seen,
+                d.last_seen,
+                &mut report,
+            )?;
         }
 
         for edge in &g.edges {
@@ -231,38 +370,84 @@ impl Store {
                     // Edges built from process_birth don't carry their own
                     // wall time; fall back to the child node's last_seen.
                     let seen_at = node_last_seen(&tx, "process", &to_id)?;
-                    upsert_edge(&tx, EdgeRow {
-                        kind: "parent_of",
-                        from_kind: "process", from_id: &from_id,
-                        to_kind: "process",   to_id: &to_id,
-                        seen_at,
-                        attrs: "{}",
-                    }, &mut report)?;
+                    upsert_edge(
+                        &tx,
+                        EdgeRow {
+                            kind: "parent_of",
+                            from_kind: "process",
+                            from_id: &from_id,
+                            to_kind: "process",
+                            to_id: &to_id,
+                            seen_at,
+                            attrs: "{}",
+                        },
+                        &mut report,
+                    )?;
                 }
-                Edge::FrontmostDuring { app, process, overlap } => {
+                Edge::FrontmostDuring {
+                    app,
+                    process,
+                    overlap,
+                } => {
                     let to_id = process_id_to_string(process);
                     let attrs = serde_json::to_string(&serde_json::json!({
                         "overlap": overlap,
                     }))?;
-                    upsert_edge(&tx, EdgeRow {
-                        kind: "frontmost_during",
-                        from_kind: "app",     from_id: app,
-                        to_kind: "process",   to_id: &to_id,
-                        seen_at: overlap.to.unwrap_or(overlap.from),
-                        attrs: &attrs,
-                    }, &mut report)?;
+                    upsert_edge(
+                        &tx,
+                        EdgeRow {
+                            kind: "frontmost_during",
+                            from_kind: "app",
+                            from_id: app,
+                            to_kind: "process",
+                            to_id: &to_id,
+                            seen_at: overlap.to.unwrap_or(overlap.from),
+                            attrs: &attrs,
+                        },
+                        &mut report,
+                    )?;
                 }
                 Edge::OpenedSocket { process, socket } => {
                     let from_id = process_id_to_string(process);
                     let to_id = socket_id_to_string(socket);
                     let seen_at = node_last_seen(&tx, "socket", &to_id)?;
-                    upsert_edge(&tx, EdgeRow {
-                        kind: "opened_socket",
-                        from_kind: "process", from_id: &from_id,
-                        to_kind: "socket",    to_id: &to_id,
-                        seen_at,
-                        attrs: "{}",
-                    }, &mut report)?;
+                    upsert_edge(
+                        &tx,
+                        EdgeRow {
+                            kind: "opened_socket",
+                            from_kind: "process",
+                            from_id: &from_id,
+                            to_kind: "socket",
+                            to_id: &to_id,
+                            seen_at,
+                            attrs: "{}",
+                        },
+                        &mut report,
+                    )?;
+                }
+                Edge::QueriedDomain {
+                    process,
+                    domain,
+                    count,
+                } => {
+                    let from_id = process_id_to_string(process);
+                    let seen_at = node_last_seen(&tx, "domain", domain)?;
+                    let attrs = serde_json::to_string(&serde_json::json!({
+                        "queries": count,
+                    }))?;
+                    upsert_edge(
+                        &tx,
+                        EdgeRow {
+                            kind: "queried_domain",
+                            from_kind: "process",
+                            from_id: &from_id,
+                            to_kind: "domain",
+                            to_id: domain,
+                            seen_at,
+                            attrs: &attrs,
+                        },
+                        &mut report,
+                    )?;
                 }
             }
         }
@@ -277,9 +462,9 @@ impl Store {
         let mut g = Graph::default();
 
         // Processes
-        let mut stmt = self.conn.prepare(
-            "SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let attrs: String = r.get(1)?;
@@ -292,23 +477,39 @@ impl Store {
             let pid_id = process_id_from_string(&id_str);
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
             let death_v = v.get("death").cloned().unwrap_or(serde_json::Value::Null);
-            let death: Option<Timestamp> = if death_v.is_null() { None } else { serde_json::from_value(death_v).ok() };
+            let death: Option<Timestamp> = if death_v.is_null() {
+                None
+            } else {
+                serde_json::from_value(death_v).ok()
+            };
             g.processes.push(ProcessNode {
                 id: pid_id,
                 comm: v.get("comm").and_then(|x| x.as_str()).map(String::from),
                 name: v.get("name").and_then(|x| x.as_str()).map(String::from),
-                exec_path: v.get("exec_path").and_then(|x| x.as_str()).map(String::from),
-                ppid: v.get("ppid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-                uid: v.get("uid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-                birth: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
+                exec_path: v
+                    .get("exec_path")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
+                ppid: v
+                    .get("ppid")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                uid: v
+                    .get("uid")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                birth: Timestamp {
+                    mono_ns: first_seen as u64,
+                    wall_anchor_ns: 0,
+                },
                 death,
             });
         }
 
         // Apps
-        let mut stmt = self.conn.prepare(
-            "SELECT id, attrs FROM nodes WHERE kind = 'app'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs FROM nodes WHERE kind = 'app'")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let attrs: String = r.get(1)?;
@@ -317,22 +518,26 @@ impl Store {
         for row in rows {
             let (id, attrs) = row?;
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
-            let intervals: Vec<Interval> = v.get("intervals")
+            let intervals: Vec<Interval> = v
+                .get("intervals")
                 .cloned()
                 .and_then(|x| serde_json::from_value(x).ok())
                 .unwrap_or_default();
             g.apps.push(AppNode {
                 id,
                 name: v.get("name").and_then(|x| x.as_str()).map(String::from),
-                exec_path: v.get("exec_path").and_then(|x| x.as_str()).map(String::from),
+                exec_path: v
+                    .get("exec_path")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
                 intervals,
             });
         }
 
         // Sockets
-        let mut stmt = self.conn.prepare(
-            "SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'socket'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'socket'")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let attrs: String = r.get(1)?;
@@ -344,18 +549,42 @@ impl Store {
             let (_id, attrs, first_seen, last_seen) = row?;
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
             let sid = SocketId {
-                proto: v.get("proto").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                local_addr: v.get("local_addr").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                foreign_addr: v.get("foreign_addr").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                proto: v
+                    .get("proto")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                local_addr: v
+                    .get("local_addr")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                foreign_addr: v
+                    .get("foreign_addr")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
             };
             g.sockets.push(SocketNode {
                 id: sid,
                 state: v.get("state").and_then(|x| x.as_str()).map(String::from),
-                process_name: v.get("process_name").and_then(|x| x.as_str()).map(String::from),
-                pid_at_open: v.get("pid_at_open").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-                opened: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
+                process_name: v
+                    .get("process_name")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
+                pid_at_open: v
+                    .get("pid_at_open")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                opened: Timestamp {
+                    mono_ns: first_seen as u64,
+                    wall_anchor_ns: 0,
+                },
                 closed: if last_seen > first_seen {
-                    Some(Timestamp { mono_ns: last_seen as u64, wall_anchor_ns: 0 })
+                    Some(Timestamp {
+                        mono_ns: last_seen as u64,
+                        wall_anchor_ns: 0,
+                    })
                 } else {
                     None
                 },
@@ -365,9 +594,9 @@ impl Store {
         }
 
         // Files
-        let mut stmt = self.conn.prepare(
-            "SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'file'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'file'")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let attrs: String = r.get(1)?;
@@ -378,22 +607,47 @@ impl Store {
         for row in rows {
             let (path, attrs, first_seen, last_seen) = row?;
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
-            let flags: Vec<String> = v.get("flags").cloned()
+            let flags: Vec<String> = v
+                .get("flags")
+                .cloned()
                 .and_then(|x| serde_json::from_value(x).ok())
                 .unwrap_or_default();
             g.files.push(FileNode {
                 path,
                 flags,
-                first_seen: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
-                last_seen: Timestamp { mono_ns: last_seen as u64, wall_anchor_ns: 0 },
+                first_seen: Timestamp {
+                    mono_ns: first_seen as u64,
+                    wall_anchor_ns: 0,
+                },
+                last_seen: Timestamp {
+                    mono_ns: last_seen as u64,
+                    wall_anchor_ns: 0,
+                },
                 touch_count: v.get("touch_count").and_then(|x| x.as_u64()).unwrap_or(0),
             });
         }
 
+        // Domains
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'domain'")?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let attrs: String = r.get(1)?;
+            let first_seen: i64 = r.get(2)?;
+            let last_seen: i64 = r.get(3)?;
+            Ok((id, attrs, first_seen, last_seen))
+        })?;
+        for row in rows {
+            let (name, attrs, first_seen, last_seen) = row?;
+            g.domains
+                .push(domain_from_row((name, attrs, first_seen, last_seen))?);
+        }
+
         // Edges
-        let mut stmt = self.conn.prepare(
-            "SELECT kind, from_kind, from_id, to_kind, to_id, attrs FROM edges",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, from_kind, from_id, to_kind, to_id, attrs FROM edges")?;
         let rows = stmt.query_map([], |r| {
             let kind: String = r.get(0)?;
             let from_kind: String = r.get(1)?;
@@ -414,9 +668,17 @@ impl Store {
                 }
                 "frontmost_during" => {
                     let v: serde_json::Value = serde_json::from_str(&attrs)?;
-                    let overlap: Interval = v.get("overlap").cloned()
+                    let overlap: Interval = v
+                        .get("overlap")
+                        .cloned()
                         .and_then(|x| serde_json::from_value(x).ok())
-                        .unwrap_or(Interval { from: Timestamp { mono_ns: 0, wall_anchor_ns: 0 }, to: None });
+                        .unwrap_or(Interval {
+                            from: Timestamp {
+                                mono_ns: 0,
+                                wall_anchor_ns: 0,
+                            },
+                            to: None,
+                        });
                     g.edges.push(Edge::FrontmostDuring {
                         app: from_id,
                         process: process_id_from_string(&to_id),
@@ -426,7 +688,9 @@ impl Store {
                 "opened_socket" => {
                     // Re-parse socket id (we stored "proto|local|foreign").
                     let parts: Vec<&str> = to_id.splitn(3, '|').collect();
-                    if parts.len() != 3 { continue; }
+                    if parts.len() != 3 {
+                        continue;
+                    }
                     g.edges.push(Edge::OpenedSocket {
                         process: process_id_from_string(&from_id),
                         socket: SocketId {
@@ -434,6 +698,14 @@ impl Store {
                             local_addr: parts[1].into(),
                             foreign_addr: parts[2].into(),
                         },
+                    });
+                }
+                "queried_domain" => {
+                    let v: serde_json::Value = serde_json::from_str(&attrs)?;
+                    g.edges.push(Edge::QueriedDomain {
+                        process: process_id_from_string(&from_id),
+                        domain: to_id,
+                        count: v.get("queries").and_then(|x| x.as_u64()).unwrap_or(1),
                     });
                 }
                 other => {
@@ -487,9 +759,9 @@ impl Store {
     /// them either). Empty `allowed_prefixes` is treated as "everything is
     /// untrusted" and returns every process with an exec_path.
     pub fn processes_outside_paths(&self, allowed_prefixes: &[&str]) -> Result<Vec<ProcessNode>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'")?;
         let rows = stmt.query_map([], row_to_process_tuple)?;
         let mut out = Vec::new();
         for row in rows {
@@ -497,9 +769,13 @@ impl Store {
             let p = process_from_row(tuple)?;
             let trusted = match p.exec_path.as_deref() {
                 None => false, // unknown path is not "trusted"
-                Some(path) => allowed_prefixes.iter().any(|prefix| path.starts_with(prefix)),
+                Some(path) => allowed_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix)),
             };
-            if !trusted { out.push(p); }
+            if !trusted {
+                out.push(p);
+            }
         }
         Ok(out)
     }
@@ -534,83 +810,157 @@ impl Store {
                  WHERE kind = ?1 AND first_seen <= ?2 AND last_seen >= ?3",
             )?;
             let rows = stmt.query_map(params![kind, to_unix_ns, from_unix_ns], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })?;
             let mut out = Vec::new();
-            for row in rows { out.push(row?); }
+            for row in rows {
+                out.push(row?);
+            }
             Ok(out)
         };
 
         for (id_str, attrs, first_seen, last_seen) in load_kind("process")? {
-            g.processes.push(process_from_row((id_str, attrs, first_seen, last_seen))?);
+            g.processes
+                .push(process_from_row((id_str, attrs, first_seen, last_seen))?);
         }
         for (id, attrs, _first_seen, _last_seen) in load_kind("app")? {
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
-            let intervals: Vec<Interval> = v.get("intervals").cloned()
-                .and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default();
+            let intervals: Vec<Interval> = v
+                .get("intervals")
+                .cloned()
+                .and_then(|x| serde_json::from_value(x).ok())
+                .unwrap_or_default();
             g.apps.push(AppNode {
                 id,
                 name: v.get("name").and_then(|x| x.as_str()).map(String::from),
-                exec_path: v.get("exec_path").and_then(|x| x.as_str()).map(String::from),
+                exec_path: v
+                    .get("exec_path")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
                 intervals,
             });
         }
         for (_id, attrs, first_seen, last_seen) in load_kind("socket")? {
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
             let sid = SocketId {
-                proto: v.get("proto").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                local_addr: v.get("local_addr").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                foreign_addr: v.get("foreign_addr").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                proto: v
+                    .get("proto")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                local_addr: v
+                    .get("local_addr")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                foreign_addr: v
+                    .get("foreign_addr")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
             };
             g.sockets.push(SocketNode {
                 id: sid,
                 state: v.get("state").and_then(|x| x.as_str()).map(String::from),
-                process_name: v.get("process_name").and_then(|x| x.as_str()).map(String::from),
-                pid_at_open: v.get("pid_at_open").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-                opened: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
+                process_name: v
+                    .get("process_name")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
+                pid_at_open: v
+                    .get("pid_at_open")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                opened: Timestamp {
+                    mono_ns: first_seen as u64,
+                    wall_anchor_ns: 0,
+                },
                 closed: if last_seen > first_seen {
-                    Some(Timestamp { mono_ns: last_seen as u64, wall_anchor_ns: 0 })
-                } else { None },
+                    Some(Timestamp {
+                        mono_ns: last_seen as u64,
+                        wall_anchor_ns: 0,
+                    })
+                } else {
+                    None
+                },
                 rxbytes_last: v.get("rxbytes_last").and_then(|x| x.as_u64()),
                 txbytes_last: v.get("txbytes_last").and_then(|x| x.as_u64()),
             });
         }
         for (path, attrs, first_seen, last_seen) in load_kind("file")? {
             let v: serde_json::Value = serde_json::from_str(&attrs)?;
-            let flags: Vec<String> = v.get("flags").cloned()
-                .and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default();
+            let flags: Vec<String> = v
+                .get("flags")
+                .cloned()
+                .and_then(|x| serde_json::from_value(x).ok())
+                .unwrap_or_default();
             g.files.push(FileNode {
                 path,
                 flags,
-                first_seen: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
-                last_seen: Timestamp { mono_ns: last_seen as u64, wall_anchor_ns: 0 },
+                first_seen: Timestamp {
+                    mono_ns: first_seen as u64,
+                    wall_anchor_ns: 0,
+                },
+                last_seen: Timestamp {
+                    mono_ns: last_seen as u64,
+                    wall_anchor_ns: 0,
+                },
                 touch_count: v.get("touch_count").and_then(|x| x.as_u64()).unwrap_or(0),
             });
+        }
+
+        for (name, attrs, first_seen, last_seen) in load_kind("domain")? {
+            g.domains
+                .push(domain_from_row((name, attrs, first_seen, last_seen))?);
         }
 
         // Build a quick membership set so we can drop edges whose endpoints
         // fell outside the window. Cheaper than re-issuing per-edge node
         // existence queries and bounds the edge set without trusting the
         // edges' own `last_seen` column.
-        let mut have: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        for p in &g.processes { have.insert(("process".into(), process_id_to_string(&p.id))); }
-        for a in &g.apps      { have.insert(("app".into(), a.id.clone())); }
-        for s in &g.sockets   { have.insert(("socket".into(), socket_id_to_string(&s.id))); }
-        for f in &g.files     { have.insert(("file".into(), f.path.clone())); }
+        let mut have: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for p in &g.processes {
+            have.insert(("process".into(), process_id_to_string(&p.id)));
+        }
+        for a in &g.apps {
+            have.insert(("app".into(), a.id.clone()));
+        }
+        for s in &g.sockets {
+            have.insert(("socket".into(), socket_id_to_string(&s.id)));
+        }
+        for f in &g.files {
+            have.insert(("file".into(), f.path.clone()));
+        }
+        for d in &g.domains {
+            have.insert(("domain".into(), d.name.clone()));
+        }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT kind, from_kind, from_id, to_kind, to_id, attrs FROM edges",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, from_kind, from_id, to_kind, to_id, attrs FROM edges")?;
         let rows = stmt.query_map([], |r| {
             Ok((
-                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         for row in rows {
             let (kind, from_kind, from_id, to_kind, to_id, attrs) = row?;
-            if !have.contains(&(from_kind.clone(), from_id.clone())) { continue; }
-            if !have.contains(&(to_kind.clone(), to_id.clone())) { continue; }
+            if !have.contains(&(from_kind.clone(), from_id.clone())) {
+                continue;
+            }
+            if !have.contains(&(to_kind.clone(), to_id.clone())) {
+                continue;
+            }
             match kind.as_str() {
                 "parent_of" => g.edges.push(Edge::ParentOf {
                     parent: process_id_from_string(&from_id),
@@ -618,16 +968,28 @@ impl Store {
                 }),
                 "frontmost_during" => {
                     let v: serde_json::Value = serde_json::from_str(&attrs)?;
-                    let overlap: Interval = v.get("overlap").cloned()
+                    let overlap: Interval = v
+                        .get("overlap")
+                        .cloned()
                         .and_then(|x| serde_json::from_value(x).ok())
-                        .unwrap_or(Interval { from: Timestamp { mono_ns: 0, wall_anchor_ns: 0 }, to: None });
+                        .unwrap_or(Interval {
+                            from: Timestamp {
+                                mono_ns: 0,
+                                wall_anchor_ns: 0,
+                            },
+                            to: None,
+                        });
                     g.edges.push(Edge::FrontmostDuring {
-                        app: from_id, process: process_id_from_string(&to_id), overlap,
+                        app: from_id,
+                        process: process_id_from_string(&to_id),
+                        overlap,
                     });
                 }
                 "opened_socket" => {
                     let parts: Vec<&str> = to_id.splitn(3, '|').collect();
-                    if parts.len() != 3 { continue; }
+                    if parts.len() != 3 {
+                        continue;
+                    }
                     g.edges.push(Edge::OpenedSocket {
                         process: process_id_from_string(&from_id),
                         socket: SocketId {
@@ -635,6 +997,14 @@ impl Store {
                             local_addr: parts[1].into(),
                             foreign_addr: parts[2].into(),
                         },
+                    });
+                }
+                "queried_domain" => {
+                    let v: serde_json::Value = serde_json::from_str(&attrs)?;
+                    g.edges.push(Edge::QueriedDomain {
+                        process: process_id_from_string(&from_id),
+                        domain: to_id,
+                        count: v.get("queries").and_then(|x| x.as_u64()).unwrap_or(1),
                     });
                 }
                 _ => {}
@@ -672,7 +1042,9 @@ impl Store {
             })
         })?;
         let mut out = Vec::new();
-        for row in rows { out.push(row?); }
+        for row in rows {
+            out.push(row?);
+        }
         Ok(out)
     }
 
@@ -726,7 +1098,9 @@ impl Store {
             let (app_id, app_name, process_id, from_mono, from_anchor, to_mono, to_anchor) = row?;
             // overlap.from is required; if it's missing the row is malformed
             // and we skip rather than guess.
-            let Some(from_mono) = from_mono else { continue; };
+            let Some(from_mono) = from_mono else {
+                continue;
+            };
             // For round-tripped graphs `wall_anchor_ns` may be 0, in which
             // case `mono_ns` is itself the unix-ns timestamp (same convention
             // as `ts_to_unix_ns` on the write side).
@@ -736,10 +1110,13 @@ impl Store {
                 None => to_unix_ns, // open-ended → clip to window end
             };
             // Overlap test against the requested window.
-            if seg_to < from_unix_ns || seg_from > to_unix_ns { continue; }
+            if seg_to < from_unix_ns || seg_from > to_unix_ns {
+                continue;
+            }
             let clipped_from = seg_from.max(from_unix_ns);
             let clipped_to = seg_to.min(to_unix_ns);
-            let duration_secs = (clipped_to.saturating_sub(clipped_from) / 1_000_000_000).max(0) as u64;
+            let duration_secs =
+                (clipped_to.saturating_sub(clipped_from) / 1_000_000_000).max(0) as u64;
             // Bundle id is the edge's `from_id` (apps are keyed by bundle).
             out.push(FocusSegment {
                 app_id: app_id.clone(),
@@ -764,7 +1141,9 @@ impl Store {
     /// Implemented as a recursive CTE so SQLite walks the chain in one
     /// query rather than per-hop round-trips.
     pub fn ancestors_of(&self, pid_id: &str, max_depth: u32) -> Result<Vec<ProcessNode>> {
-        if max_depth == 0 { return Ok(Vec::new()); }
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE chain(id, depth) AS (
                  SELECT e.from_id, 1
@@ -783,12 +1162,16 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![pid_id, max_depth as i64], |r| {
             Ok((
-                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,    r.get::<_, i64>(3)?,
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
             ))
         })?;
         let mut out = Vec::new();
-        for row in rows { out.push(process_from_row(row?)?); }
+        for row in rows {
+            out.push(process_from_row(row?)?);
+        }
         Ok(out)
     }
 
@@ -824,6 +1207,193 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Top N domains by query count, descending. Distinct-process counts come
+    /// from `queried_domain` edges (0 when no query could be attributed to a
+    /// process).
+    pub fn top_domains(&self, limit: usize) -> Result<Vec<DomainSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                 n.id,
+                 COALESCE(CAST(json_extract(n.attrs, '$.query_count') AS INTEGER), 0) AS query_count,
+                 (SELECT COUNT(DISTINCT e.from_id) FROM edges e
+                   WHERE e.kind = 'queried_domain' AND e.to_id = n.id) AS distinct_processes,
+                 n.last_seen
+             FROM nodes n
+             WHERE n.kind = 'domain'
+             ORDER BY query_count DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(DomainSummary {
+                name: r.get::<_, String>(0)?,
+                query_count: r.get::<_, i64>(1)?.max(0) as u64,
+                distinct_processes: r.get::<_, i64>(2)?.max(0) as u32,
+                last_seen_unix_ns: r.get::<_, i64>(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Append Layer 2 events to the durable history table. Unlike the graph
+    /// tables this grows with event volume, not entity count — `prune_before`
+    /// is the corresponding bound. Timestamps are stored as wall-clock unix
+    /// nanoseconds (same convention as node/edge columns). Returns the number
+    /// of rows written.
+    pub fn append_events(&mut self, events: &[Event]) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let mut written = 0u64;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO events(ts_unix_ns, kind, pid, schema_version, payload)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for ev in events {
+                let ts = ts_to_unix_ns(ev.timestamp) as i64;
+                let kind = event_kind_to_string(ev.kind)?;
+                let payload = serde_json::to_string(&ev.payload)?;
+                stmt.execute(params![ts, kind, ev.pid, ev.schema_version, payload])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Read back events whose timestamp falls in `[from_unix_ns, to_unix_ns]`,
+    /// oldest first, optionally filtered to `kinds`, capped at `limit` rows.
+    /// Round-tripped events carry the unix-ns value in `timestamp.mono_ns`
+    /// with a zero anchor — the same convention as graph round-trips.
+    pub fn events_in_window(
+        &self,
+        from_unix_ns: i64,
+        to_unix_ns: i64,
+        kinds: Option<&[EventKind]>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        // The kind filter is applied in Rust rather than SQL to keep the
+        // statement static; event volume in a window is already bounded by
+        // the time predicate + index.
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_unix_ns, kind, pid, schema_version, payload
+             FROM events
+             WHERE ts_unix_ns >= ?1 AND ts_unix_ns <= ?2
+             ORDER BY ts_unix_ns ASC",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns, to_unix_ns], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<u32>>(2)?,
+                r.get::<_, u32>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            if out.len() >= limit {
+                break;
+            }
+            let (ts, kind_str, pid, schema_version, payload) = row?;
+            let Ok(kind) = event_kind_from_string(&kind_str) else {
+                tracing::warn!(
+                    "aw-store::events_in_window: unknown event kind '{kind_str}'; skipping"
+                );
+                continue;
+            };
+            if let Some(ks) = kinds {
+                if !ks.contains(&kind) {
+                    continue;
+                }
+            }
+            out.push(Event {
+                schema_version,
+                timestamp: Timestamp {
+                    mono_ns: ts as u64,
+                    wall_anchor_ns: 0,
+                },
+                kind,
+                pid,
+                payload: serde_json::from_str(&payload)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Retention: delete every node and edge whose `last_seen` is strictly
+    /// before `cutoff_unix_ns`, any edge left dangling because one of its
+    /// endpoints was deleted, and every event older than the cutoff. The
+    /// store is otherwise append-only, so this is the one sanctioned way to
+    /// bound a long-lived `world.db`.
+    pub fn prune_before(&mut self, cutoff_unix_ns: i64) -> Result<PruneReport> {
+        let tx = self.conn.transaction()?;
+        let events_deleted = tx.execute(
+            "DELETE FROM events WHERE ts_unix_ns < ?1",
+            params![cutoff_unix_ns],
+        )?;
+        let edges_by_age = tx.execute(
+            "DELETE FROM edges WHERE last_seen < ?1",
+            params![cutoff_unix_ns],
+        )?;
+        let nodes_deleted = tx.execute(
+            "DELETE FROM nodes WHERE last_seen < ?1",
+            params![cutoff_unix_ns],
+        )?;
+        // Surviving edges may now reference deleted nodes; drop them too so
+        // load_graph never materializes an edge with a missing endpoint.
+        let edges_dangling = tx.execute(
+            "DELETE FROM edges
+             WHERE NOT EXISTS (SELECT 1 FROM nodes n
+                               WHERE n.kind = edges.from_kind AND n.id = edges.from_id)
+                OR NOT EXISTS (SELECT 1 FROM nodes n
+                               WHERE n.kind = edges.to_kind AND n.id = edges.to_id)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(PruneReport {
+            nodes_deleted: nodes_deleted as u64,
+            edges_deleted: (edges_by_age + edges_dangling) as u64,
+            events_deleted: events_deleted as u64,
+        })
+    }
+
+    /// Cheap overview of what the store holds: row counts per node/edge kind
+    /// and the wall-clock span covered. Powers `aw-query summary`.
+    pub fn summary(&self) -> Result<StoreSummary> {
+        let mut out = StoreSummary::default();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, COUNT(*) FROM nodes GROUP BY kind ORDER BY COUNT(*) DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (kind, n) = row?;
+            out.node_counts.push((kind, n.max(0) as u64));
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY COUNT(*) DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (kind, n) = row?;
+            out.edge_counts.push((kind, n.max(0) as u64));
+        }
+        let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(first_seen), MAX(last_seen) FROM nodes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        out.first_seen_unix_ns = first;
+        out.last_seen_unix_ns = last;
+        out.event_count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))?
+            .max(0) as u64;
+        Ok(out)
+    }
 }
 
 // Shape of a `nodes` SELECT we project into `ProcessNode`: (id, attrs, first_seen, last_seen).
@@ -838,17 +1408,76 @@ fn process_from_row(row: ProcessRow) -> Result<ProcessNode> {
     let pid_id = process_id_from_string(&id_str);
     let v: serde_json::Value = serde_json::from_str(&attrs)?;
     let death_v = v.get("death").cloned().unwrap_or(serde_json::Value::Null);
-    let death: Option<Timestamp> = if death_v.is_null() { None } else { serde_json::from_value(death_v).ok() };
+    let death: Option<Timestamp> = if death_v.is_null() {
+        None
+    } else {
+        serde_json::from_value(death_v).ok()
+    };
     Ok(ProcessNode {
         id: pid_id,
         comm: v.get("comm").and_then(|x| x.as_str()).map(String::from),
         name: v.get("name").and_then(|x| x.as_str()).map(String::from),
-        exec_path: v.get("exec_path").and_then(|x| x.as_str()).map(String::from),
-        ppid: v.get("ppid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-        uid: v.get("uid").and_then(|x| x.as_u64()).and_then(|n| u32::try_from(n).ok()),
-        birth: Timestamp { mono_ns: first_seen as u64, wall_anchor_ns: 0 },
+        exec_path: v
+            .get("exec_path")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        ppid: v
+            .get("ppid")
+            .and_then(|x| x.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        uid: v
+            .get("uid")
+            .and_then(|x| x.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        birth: Timestamp {
+            mono_ns: first_seen as u64,
+            wall_anchor_ns: 0,
+        },
         death,
     })
+}
+
+/// Project a `(id, attrs, first_seen, last_seen)` domain-node row into a
+/// `DomainNode`. Shared by `load_graph` and `graph_in_window`.
+fn domain_from_row(row: (String, String, i64, i64)) -> Result<DomainNode> {
+    let (name, attrs, first_seen, last_seen) = row;
+    let v: serde_json::Value = serde_json::from_str(&attrs)?;
+    let qtypes: Vec<String> = v
+        .get("qtypes")
+        .cloned()
+        .and_then(|x| serde_json::from_value(x).ok())
+        .unwrap_or_default();
+    Ok(DomainNode {
+        name,
+        qtypes,
+        masked: v.get("masked").and_then(|x| x.as_bool()).unwrap_or(false),
+        first_seen: Timestamp {
+            mono_ns: first_seen as u64,
+            wall_anchor_ns: 0,
+        },
+        last_seen: Timestamp {
+            mono_ns: last_seen as u64,
+            wall_anchor_ns: 0,
+        },
+        query_count: v.get("query_count").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+/// `EventKind` ↔ its snake_case serde string, reusing the enum's own serde
+/// mapping so the DB encoding can never drift from the wire encoding.
+fn event_kind_to_string(kind: EventKind) -> Result<String> {
+    match serde_json::to_value(kind)? {
+        serde_json::Value::String(s) => Ok(s),
+        other => Err(StoreError::Json(serde::de::Error::custom(format!(
+            "EventKind serialized to non-string {other}"
+        )))),
+    }
+}
+
+fn event_kind_from_string(s: &str) -> Result<EventKind> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        s.to_string(),
+    ))?)
 }
 
 // ---------- helpers --------------------------------------------------------
@@ -866,11 +1495,14 @@ fn upsert_node(
     let last = ts_to_unix_ns(last_seen) as i64;
     // Pre-check existence inside the transaction so the report can accurately
     // distinguish inserted from updated. Uses the PK index — cheap.
-    let existed: bool = tx.query_row(
-        "SELECT 1 FROM nodes WHERE kind = ?1 AND id = ?2",
-        params![kind, id],
-        |_| Ok(true),
-    ).optional()?.unwrap_or(false);
+    let existed: bool = tx
+        .query_row(
+            "SELECT 1 FROM nodes WHERE kind = ?1 AND id = ?2",
+            params![kind, id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
 
     tx.execute(
         "INSERT INTO nodes(kind, id, attrs, first_seen, last_seen)
@@ -882,7 +1514,11 @@ fn upsert_node(
         params![kind, id, attrs, first, last],
     )?;
 
-    if existed { report.nodes_updated += 1; } else { report.nodes_inserted += 1; }
+    if existed {
+        report.nodes_updated += 1;
+    } else {
+        report.nodes_inserted += 1;
+    }
     Ok(())
 }
 
@@ -915,16 +1551,22 @@ fn upsert_edge(tx: &Transaction<'_>, e: EdgeRow<'_>, report: &mut MergeReport) -
              attrs     = excluded.attrs",
         params![e.kind, e.from_kind, e.from_id, e.to_kind, e.to_id, seen, e.attrs],
     )?;
-    if existed { report.edges_updated += 1; } else { report.edges_inserted += 1; }
+    if existed {
+        report.edges_updated += 1;
+    } else {
+        report.edges_inserted += 1;
+    }
     Ok(())
 }
 
 fn node_last_seen(tx: &Transaction<'_>, kind: &str, id: &str) -> Result<Timestamp> {
-    let last: Option<i64> = tx.query_row(
-        "SELECT last_seen FROM nodes WHERE kind=?1 AND id=?2",
-        params![kind, id],
-        |r| r.get(0),
-    ).optional()?;
+    let last: Option<i64> = tx
+        .query_row(
+            "SELECT last_seen FROM nodes WHERE kind=?1 AND id=?2",
+            params![kind, id],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(Timestamp {
         mono_ns: last.unwrap_or(0) as u64,
         wall_anchor_ns: 0,
@@ -936,7 +1578,11 @@ fn node_last_seen(tx: &Transaction<'_>, kind: &str, id: &str) -> Result<Timestam
 /// unix-ns column). When the anchor is 0 the `mono_ns` field already holds
 /// unix nanoseconds (typical for round-tripped data); when non-zero, sum.
 fn combine_ts(mono_ns: i64, wall_anchor_ns: i64) -> i64 {
-    if wall_anchor_ns == 0 { mono_ns } else { wall_anchor_ns.saturating_add(mono_ns) }
+    if wall_anchor_ns == 0 {
+        mono_ns
+    } else {
+        wall_anchor_ns.saturating_add(mono_ns)
+    }
 }
 
 fn ts_to_unix_ns(ts: Timestamp) -> u64 {
@@ -973,12 +1619,21 @@ mod tests {
     use aw_graph::{Interval, ProcessId};
 
     fn ts(n: u64) -> Timestamp {
-        Timestamp { mono_ns: n, wall_anchor_ns: 0 }
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
     }
 
     fn small_graph() -> Graph {
-        let parent_id = ProcessId { pid: 1, start_unix_secs: 1000 };
-        let child_id = ProcessId { pid: 42, start_unix_secs: 1001 };
+        let parent_id = ProcessId {
+            pid: 1,
+            start_unix_secs: 1000,
+        };
+        let child_id = ProcessId {
+            pid: 42,
+            start_unix_secs: 1001,
+        };
         let sock_id = SocketId {
             proto: "tcp4".into(),
             local_addr: "10.0.0.1.50000".into(),
@@ -1025,9 +1680,16 @@ mod tests {
                 last_seen: ts(40),
                 touch_count: 3,
             }],
+            domains: vec![],
             edges: vec![
-                Edge::ParentOf { parent: parent_id.clone(), child: child_id.clone() },
-                Edge::OpenedSocket { process: child_id.clone(), socket: sock_id.clone() },
+                Edge::ParentOf {
+                    parent: parent_id.clone(),
+                    child: child_id.clone(),
+                },
+                Edge::OpenedSocket {
+                    process: child_id.clone(),
+                    socket: sock_id.clone(),
+                },
             ],
         }
     }
@@ -1051,13 +1713,17 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&small_graph()).unwrap();
         let r2 = s.merge_graph(&small_graph()).unwrap();
-        assert_eq!(r2.edges_updated, 2, "every edge should be updated, not inserted; got {r2:?}");
+        assert_eq!(
+            r2.edges_updated, 2,
+            "every edge should be updated, not inserted; got {r2:?}"
+        );
         // Verify count actually bumped in SQL.
-        let c: i64 = s.conn.query_row(
-            "SELECT count FROM edges WHERE kind='parent_of'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let c: i64 = s
+            .conn
+            .query_row("SELECT count FROM edges WHERE kind='parent_of'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(c, 2);
     }
 
@@ -1097,10 +1763,14 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&small_graph()).unwrap();
         let loaded = s.load_graph().unwrap();
-        let parent_of = loaded.edges.iter()
+        let parent_of = loaded
+            .edges
+            .iter()
             .filter(|e| matches!(e, Edge::ParentOf { .. }))
             .count();
-        let opened_socket = loaded.edges.iter()
+        let opened_socket = loaded
+            .edges
+            .iter()
             .filter(|e| matches!(e, Edge::OpenedSocket { .. }))
             .count();
         assert_eq!(parent_of, 1);
@@ -1117,11 +1787,14 @@ mod tests {
         // Second merge with lower birth time — first_seen should hold the older value.
         g.processes[1].birth = ts(20);
         s.merge_graph(&g).unwrap();
-        let first_seen: i64 = s.conn.query_row(
-            "SELECT first_seen FROM nodes WHERE kind='process' AND id='42:1001'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let first_seen: i64 = s
+            .conn
+            .query_row(
+                "SELECT first_seen FROM nodes WHERE kind='process' AND id='42:1001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(first_seen, 20);
     }
 
@@ -1129,43 +1802,84 @@ mod tests {
     /// suspicion-query tests are self-contained.
     fn suspicion_graph() -> Graph {
         let init = ProcessNode {
-            id: ProcessId { pid: 1, start_unix_secs: 1000 },
-            comm: Some("launchd".into()), name: None,
+            id: ProcessId {
+                pid: 1,
+                start_unix_secs: 1000,
+            },
+            comm: Some("launchd".into()),
+            name: None,
             exec_path: Some("/sbin/launchd".into()),
-            ppid: None, uid: Some(0),
-            birth: ts(1), death: None,
+            ppid: None,
+            uid: Some(0),
+            birth: ts(1),
+            death: None,
         };
         // Non-root user shell.
         let shell = ProcessNode {
-            id: ProcessId { pid: 100, start_unix_secs: 1001 },
-            comm: Some("zsh".into()), name: None,
+            id: ProcessId {
+                pid: 100,
+                start_unix_secs: 1001,
+            },
+            comm: Some("zsh".into()),
+            name: None,
             exec_path: Some("/bin/zsh".into()),
-            ppid: Some(1), uid: Some(501),
-            birth: ts(2), death: None,
+            ppid: Some(1),
+            uid: Some(501),
+            birth: ts(2),
+            death: None,
         };
         // Root child of the non-root shell — the suspicious one.
         let suspicious = ProcessNode {
-            id: ProcessId { pid: 200, start_unix_secs: 1002 },
-            comm: Some("rooted".into()), name: None,
+            id: ProcessId {
+                pid: 200,
+                start_unix_secs: 1002,
+            },
+            comm: Some("rooted".into()),
+            name: None,
             exec_path: Some("/tmp/rooted".into()),
-            ppid: Some(100), uid: Some(0),
-            birth: ts(3), death: None,
+            ppid: Some(100),
+            uid: Some(0),
+            birth: ts(3),
+            death: None,
         };
         // Boring user process in /usr/bin — should NOT be flagged by either query.
         let curl = ProcessNode {
-            id: ProcessId { pid: 300, start_unix_secs: 1003 },
-            comm: Some("curl".into()), name: None,
+            id: ProcessId {
+                pid: 300,
+                start_unix_secs: 1003,
+            },
+            comm: Some("curl".into()),
+            name: None,
             exec_path: Some("/usr/bin/curl".into()),
-            ppid: Some(100), uid: Some(501),
-            birth: ts(4), death: None,
+            ppid: Some(100),
+            uid: Some(501),
+            birth: ts(4),
+            death: None,
         };
         Graph {
-            processes: vec![init.clone(), shell.clone(), suspicious.clone(), curl.clone()],
-            apps: vec![], sockets: vec![], files: vec![],
+            processes: vec![
+                init.clone(),
+                shell.clone(),
+                suspicious.clone(),
+                curl.clone(),
+            ],
+            apps: vec![],
+            sockets: vec![],
+            files: vec![],
+            domains: vec![],
             edges: vec![
-                Edge::ParentOf { parent: init.id.clone(),  child: shell.id.clone() },
-                Edge::ParentOf { parent: shell.id.clone(), child: suspicious.id.clone() },
-                Edge::ParentOf { parent: shell.id.clone(), child: curl.id.clone() },
+                Edge::ParentOf {
+                    parent: init.id.clone(),
+                    child: shell.id.clone(),
+                },
+                Edge::ParentOf {
+                    parent: shell.id.clone(),
+                    child: suspicious.id.clone(),
+                },
+                Edge::ParentOf {
+                    parent: shell.id.clone(),
+                    child: curl.id.clone(),
+                },
             ],
         }
     }
@@ -1175,7 +1889,11 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&suspicion_graph()).unwrap();
         let hits = s.processes_root_under_user_parent().unwrap();
-        assert_eq!(hits.len(), 1, "expected exactly one escalation; got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one escalation; got {hits:?}"
+        );
         assert_eq!(hits[0].id.pid, 200);
         assert_eq!(hits[0].comm.as_deref(), Some("rooted"));
     }
@@ -1185,7 +1903,9 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&suspicion_graph()).unwrap();
         // /sbin/, /bin/, /usr/bin/ all trusted — only /tmp/rooted should remain.
-        let hits = s.processes_outside_paths(&["/sbin/", "/bin/", "/usr/bin/"]).unwrap();
+        let hits = s
+            .processes_outside_paths(&["/sbin/", "/bin/", "/usr/bin/"])
+            .unwrap();
         assert_eq!(hits.len(), 1, "expected only /tmp/rooted; got {hits:?}");
         assert_eq!(hits[0].exec_path.as_deref(), Some("/tmp/rooted"));
     }
@@ -1203,7 +1923,7 @@ mod tests {
         let all = s.parents_with_many_children(1).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0.id.pid, 100); // 2 children first
-        assert_eq!(all[1].0.id.pid, 1);   // then launchd with 1
+        assert_eq!(all[1].0.id.pid, 1); // then launchd with 1
     }
 
     // ---------- batch 2 query tests --------------------------------------
@@ -1211,7 +1931,10 @@ mod tests {
     /// 1s spaced timestamps in unix nanoseconds; wall_anchor is 0 so
     /// `mono_ns` itself is the unix-ns value (matches round-trip convention).
     fn unix_ts(secs: u64) -> Timestamp {
-        Timestamp { mono_ns: secs * 1_000_000_000, wall_anchor_ns: 0 }
+        Timestamp {
+            mono_ns: secs * 1_000_000_000,
+            wall_anchor_ns: 0,
+        }
     }
 
     /// Build a richer fixture than `small_graph` / `suspicion_graph`:
@@ -1224,67 +1947,122 @@ mod tests {
         // we'll query. In a real long-running capture each process would
         // see its `last_seen` bumped on every re-merge.
         let p1 = ProcessNode {
-            id: ProcessId { pid: 1, start_unix_secs: 1 },
-            comm: Some("launchd".into()), name: None,
+            id: ProcessId {
+                pid: 1,
+                start_unix_secs: 1,
+            },
+            comm: Some("launchd".into()),
+            name: None,
             exec_path: Some("/sbin/launchd".into()),
-            ppid: None, uid: Some(0),
-            birth: unix_ts(0), death: Some(unix_ts(60)),
+            ppid: None,
+            uid: Some(0),
+            birth: unix_ts(0),
+            death: Some(unix_ts(60)),
         };
         let p100 = ProcessNode {
-            id: ProcessId { pid: 100, start_unix_secs: 2 },
-            comm: Some("Code".into()), name: None,
+            id: ProcessId {
+                pid: 100,
+                start_unix_secs: 2,
+            },
+            comm: Some("Code".into()),
+            name: None,
             exec_path: Some("/Applications/Code.app/Code".into()),
-            ppid: Some(1), uid: Some(501),
-            birth: unix_ts(5), death: Some(unix_ts(60)),
+            ppid: Some(1),
+            uid: Some(501),
+            birth: unix_ts(5),
+            death: Some(unix_ts(60)),
         };
         let p200 = ProcessNode {
-            id: ProcessId { pid: 200, start_unix_secs: 3 },
-            comm: Some("curl".into()), name: None,
+            id: ProcessId {
+                pid: 200,
+                start_unix_secs: 3,
+            },
+            comm: Some("curl".into()),
+            name: None,
             exec_path: Some("/usr/bin/curl".into()),
-            ppid: Some(100), uid: Some(501),
-            birth: unix_ts(10), death: Some(unix_ts(30)),
+            ppid: Some(100),
+            uid: Some(501),
+            birth: unix_ts(10),
+            death: Some(unix_ts(30)),
         };
-        let sock_a = SocketId { proto: "tcp4".into(), local_addr: "10.0.0.1.55001".into(), foreign_addr: "1.1.1.1.443".into() };
-        let sock_b = SocketId { proto: "tcp4".into(), local_addr: "10.0.0.1.55002".into(), foreign_addr: "2.2.2.2.80".into() };
+        let sock_a = SocketId {
+            proto: "tcp4".into(),
+            local_addr: "10.0.0.1.55001".into(),
+            foreign_addr: "1.1.1.1.443".into(),
+        };
+        let sock_b = SocketId {
+            proto: "tcp4".into(),
+            local_addr: "10.0.0.1.55002".into(),
+            foreign_addr: "2.2.2.2.80".into(),
+        };
         let app = AppNode {
             id: "com.microsoft.VSCode".into(),
             name: Some("Code".into()),
             exec_path: Some("/Applications/Code.app/Code".into()),
-            intervals: vec![Interval { from: unix_ts(10), to: Some(unix_ts(50)) }],
+            intervals: vec![Interval {
+                from: unix_ts(10),
+                to: Some(unix_ts(50)),
+            }],
         };
         Graph {
             processes: vec![p1.clone(), p100.clone(), p200.clone()],
             apps: vec![app],
             sockets: vec![
                 SocketNode {
-                    id: sock_a.clone(), state: Some("ESTABLISHED".into()),
-                    process_name: Some("curl".into()), pid_at_open: Some(200),
-                    opened: unix_ts(15), closed: Some(unix_ts(25)),
-                    rxbytes_last: Some(1_000), txbytes_last: Some(200),
+                    id: sock_a.clone(),
+                    state: Some("ESTABLISHED".into()),
+                    process_name: Some("curl".into()),
+                    pid_at_open: Some(200),
+                    opened: unix_ts(15),
+                    closed: Some(unix_ts(25)),
+                    rxbytes_last: Some(1_000),
+                    txbytes_last: Some(200),
                 },
                 SocketNode {
-                    id: sock_b.clone(), state: Some("ESTABLISHED".into()),
-                    process_name: Some("curl".into()), pid_at_open: Some(200),
-                    opened: unix_ts(16), closed: Some(unix_ts(28)),
-                    rxbytes_last: Some(5_000), txbytes_last: Some(500),
+                    id: sock_b.clone(),
+                    state: Some("ESTABLISHED".into()),
+                    process_name: Some("curl".into()),
+                    pid_at_open: Some(200),
+                    opened: unix_ts(16),
+                    closed: Some(unix_ts(28)),
+                    rxbytes_last: Some(5_000),
+                    txbytes_last: Some(500),
                 },
             ],
             files: vec![],
+            domains: vec![],
             edges: vec![
-                Edge::ParentOf { parent: p1.id.clone(), child: p100.id.clone() },
-                Edge::ParentOf { parent: p100.id.clone(), child: p200.id.clone() },
+                Edge::ParentOf {
+                    parent: p1.id.clone(),
+                    child: p100.id.clone(),
+                },
+                Edge::ParentOf {
+                    parent: p100.id.clone(),
+                    child: p200.id.clone(),
+                },
                 Edge::FrontmostDuring {
                     app: "com.microsoft.VSCode".into(),
                     process: p100.id.clone(),
-                    overlap: Interval { from: unix_ts(10), to: Some(unix_ts(50)) },
+                    overlap: Interval {
+                        from: unix_ts(10),
+                        to: Some(unix_ts(50)),
+                    },
                 },
-                Edge::OpenedSocket { process: p200.id.clone(), socket: sock_a.clone() },
-                Edge::OpenedSocket { process: p200.id.clone(), socket: sock_b.clone() },
+                Edge::OpenedSocket {
+                    process: p200.id.clone(),
+                    socket: sock_a.clone(),
+                },
+                Edge::OpenedSocket {
+                    process: p200.id.clone(),
+                    socket: sock_b.clone(),
+                },
             ],
         }
     }
 
-    fn ns(secs: u64) -> i64 { (secs * 1_000_000_000) as i64 }
+    fn ns(secs: u64) -> i64 {
+        (secs * 1_000_000_000) as i64
+    }
 
     #[test]
     fn graph_in_window_keeps_overlapping_nodes_and_drops_outliers() {
@@ -1303,16 +2081,31 @@ mod tests {
         assert_eq!(g.sockets.len(), 2);
 
         // All edges survive — every endpoint is in the node set.
-        let parent_edges = g.edges.iter().filter(|e| matches!(e, Edge::ParentOf { .. })).count();
-        assert_eq!(parent_edges, 2, "both parent_of edges should survive: {:?}", g.edges);
+        let parent_edges = g
+            .edges
+            .iter()
+            .filter(|e| matches!(e, Edge::ParentOf { .. }))
+            .count();
+        assert_eq!(
+            parent_edges, 2,
+            "both parent_of edges should survive: {:?}",
+            g.edges
+        );
 
         // Now a tighter window that excludes p200: 35..45 should drop the
         // 10..30 socket-owning curl process and both sockets that ended at
         // 25/28 — proving the filter actually filters.
         let g_late = s.graph_in_window(ns(35), ns(45)).unwrap();
         let late_pids: Vec<u32> = g_late.processes.iter().map(|p| p.id.pid).collect();
-        assert!(!late_pids.contains(&200), "p200 ended at 30s, should be gone: {late_pids:?}");
-        assert!(g_late.sockets.is_empty(), "sockets ended before 35s: {:?}", g_late.sockets);
+        assert!(
+            !late_pids.contains(&200),
+            "p200 ended at 30s, should be gone: {late_pids:?}"
+        );
+        assert!(
+            g_late.sockets.is_empty(),
+            "sockets ended before 35s: {:?}",
+            g_late.sockets
+        );
     }
 
     #[test]
@@ -1404,10 +2197,362 @@ mod tests {
         assert!(none.is_empty(), "launchd has no parent edge: {none:?}");
     }
 
+    /// Two processes querying two domains; both edges attributed.
+    fn dns_graph() -> Graph {
+        let curl = ProcessNode {
+            id: ProcessId {
+                pid: 42,
+                start_unix_secs: 1001,
+            },
+            comm: Some("curl".into()),
+            name: None,
+            exec_path: Some("/usr/bin/curl".into()),
+            ppid: Some(1),
+            uid: Some(501),
+            birth: unix_ts(10),
+            death: Some(unix_ts(60)),
+        };
+        let node = ProcessNode {
+            id: ProcessId {
+                pid: 43,
+                start_unix_secs: 1002,
+            },
+            comm: Some("node".into()),
+            name: None,
+            exec_path: Some("/usr/local/bin/node".into()),
+            ppid: Some(1),
+            uid: Some(501),
+            birth: unix_ts(11),
+            death: Some(unix_ts(60)),
+        };
+        Graph {
+            processes: vec![curl.clone(), node.clone()],
+            apps: vec![],
+            sockets: vec![],
+            files: vec![],
+            domains: vec![
+                DomainNode {
+                    name: "example.com".into(),
+                    qtypes: vec!["A".into(), "AAAA".into()],
+                    masked: false,
+                    first_seen: unix_ts(20),
+                    last_seen: unix_ts(40),
+                    query_count: 7,
+                },
+                DomainNode {
+                    name: "hash:abc123".into(),
+                    qtypes: vec!["HTTPS".into()],
+                    masked: true,
+                    first_seen: unix_ts(25),
+                    last_seen: unix_ts(30),
+                    query_count: 2,
+                },
+            ],
+            edges: vec![
+                Edge::QueriedDomain {
+                    process: curl.id.clone(),
+                    domain: "example.com".into(),
+                    count: 4,
+                },
+                Edge::QueriedDomain {
+                    process: node.id.clone(),
+                    domain: "example.com".into(),
+                    count: 3,
+                },
+                Edge::QueriedDomain {
+                    process: node.id.clone(),
+                    domain: "hash:abc123".into(),
+                    count: 2,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn domains_round_trip_through_store() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&dns_graph()).unwrap();
+        let loaded = s.load_graph().unwrap();
+        assert_eq!(loaded.domains.len(), 2);
+        let ex = loaded
+            .domains
+            .iter()
+            .find(|d| d.name == "example.com")
+            .unwrap();
+        assert_eq!(ex.query_count, 7);
+        assert!(!ex.masked);
+        assert!(ex.qtypes.contains(&"A".to_string()));
+        let masked = loaded
+            .domains
+            .iter()
+            .find(|d| d.name == "hash:abc123")
+            .unwrap();
+        assert!(masked.masked);
+
+        let qd: Vec<(u32, &str, u64)> = loaded
+            .edges
+            .iter()
+            .filter_map(|e| match e {
+                Edge::QueriedDomain {
+                    process,
+                    domain,
+                    count,
+                } => Some((process.pid, domain.as_str(), *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qd.len(), 3, "all queried_domain edges round-trip: {qd:?}");
+        assert!(qd.contains(&(42, "example.com", 4)));
+    }
+
+    #[test]
+    fn graph_in_window_includes_overlapping_domains() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&dns_graph()).unwrap();
+        // Window 35..50s: example.com (20..40) overlaps; hash domain (25..30) does not.
+        let g = s.graph_in_window(ns(35), ns(50)).unwrap();
+        let names: Vec<&str> = g.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["example.com"], "got {names:?}");
+        // Both processes survive (alive to 60s), so example.com edges survive
+        // but the hash-domain edge must drop with its node.
+        let qd_domains: Vec<&str> = g
+            .edges
+            .iter()
+            .filter_map(|e| match e {
+                Edge::QueriedDomain { domain, .. } => Some(domain.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(qd_domains.len(), 2, "got {qd_domains:?}");
+        assert!(qd_domains.iter().all(|d| *d == "example.com"));
+    }
+
+    #[test]
+    fn top_domains_sorted_by_query_count_with_distinct_processes() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&dns_graph()).unwrap();
+        let top = s.top_domains(10).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].name, "example.com");
+        assert_eq!(top[0].query_count, 7);
+        assert_eq!(top[0].distinct_processes, 2);
+        assert_eq!(top[1].name, "hash:abc123");
+        assert_eq!(top[1].distinct_processes, 1);
+        let one = s.top_domains(1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "example.com");
+    }
+
+    #[test]
+    fn prune_before_deletes_old_nodes_and_dangling_edges() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&windowed_graph()).unwrap();
+        // Sockets closed at 25s/28s; processes die at 60s, app interval ends
+        // at 50s. Cutoff 29s prunes exactly the two sockets.
+        let report = s.prune_before(ns(29)).unwrap();
+        assert_eq!(report.nodes_deleted, 2, "both sockets pruned: {report:?}");
+        let loaded = s.load_graph().unwrap();
+        assert!(loaded.sockets.is_empty());
+        // opened_socket edges must be gone too (dangling cleanup).
+        assert!(!loaded
+            .edges
+            .iter()
+            .any(|e| matches!(e, Edge::OpenedSocket { .. })));
+        // Processes and their parent_of edges survive.
+        assert_eq!(loaded.processes.len(), 3);
+        assert_eq!(
+            loaded
+                .edges
+                .iter()
+                .filter(|e| matches!(e, Edge::ParentOf { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn prune_before_is_noop_for_ancient_cutoff() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&windowed_graph()).unwrap();
+        let report = s.prune_before(0).unwrap();
+        assert_eq!(report.nodes_deleted, 0);
+        assert_eq!(report.edges_deleted, 0);
+    }
+
+    #[test]
+    fn summary_reports_counts_and_span() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&windowed_graph()).unwrap();
+        let sum = s.summary().unwrap();
+        let nodes: std::collections::HashMap<String, u64> =
+            sum.node_counts.iter().cloned().collect();
+        assert_eq!(nodes.get("process"), Some(&3));
+        assert_eq!(nodes.get("socket"), Some(&2));
+        assert_eq!(nodes.get("app"), Some(&1));
+        let edges: std::collections::HashMap<String, u64> =
+            sum.edge_counts.iter().cloned().collect();
+        assert_eq!(edges.get("parent_of"), Some(&2));
+        assert_eq!(edges.get("opened_socket"), Some(&2));
+        assert_eq!(sum.first_seen_unix_ns, Some(0));
+        assert!(
+            sum.last_seen_unix_ns >= Some(ns(50)),
+            "got {:?}",
+            sum.last_seen_unix_ns
+        );
+    }
+
+    #[test]
+    fn summary_on_empty_store() {
+        let s = Store::open_in_memory().unwrap();
+        let sum = s.summary().unwrap();
+        assert!(sum.node_counts.is_empty());
+        assert!(sum.edge_counts.is_empty());
+        assert_eq!(sum.first_seen_unix_ns, None);
+        assert_eq!(sum.last_seen_unix_ns, None);
+    }
+
+    fn sample_event(secs: u64, kind: EventKind, pid: Option<u32>) -> Event {
+        Event {
+            schema_version: aw_events::SCHEMA_VERSION,
+            timestamp: unix_ts(secs),
+            kind,
+            pid,
+            payload: serde_json::json!({ "marker": secs }),
+        }
+    }
+
+    #[test]
+    fn events_round_trip_in_order() {
+        let mut s = Store::open_in_memory().unwrap();
+        let evs = vec![
+            sample_event(30, EventKind::DnsQuery, Some(42)),
+            sample_event(10, EventKind::ProcessBirth, Some(1)),
+            sample_event(20, EventKind::FileChanged, None),
+        ];
+        assert_eq!(s.append_events(&evs).unwrap(), 3);
+
+        let back = s.events_in_window(ns(0), ns(100), None, 100).unwrap();
+        assert_eq!(back.len(), 3);
+        // Oldest first regardless of insert order.
+        let kinds: Vec<EventKind> = back.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::ProcessBirth,
+                EventKind::FileChanged,
+                EventKind::DnsQuery
+            ]
+        );
+        assert_eq!(back[0].pid, Some(1));
+        assert_eq!(
+            back[0].payload.get("marker").and_then(|v| v.as_u64()),
+            Some(10)
+        );
+        assert_eq!(back[0].schema_version, aw_events::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn events_window_and_kind_filter_and_limit() {
+        let mut s = Store::open_in_memory().unwrap();
+        let evs = vec![
+            sample_event(10, EventKind::DnsQuery, None),
+            sample_event(20, EventKind::DnsQuery, None),
+            sample_event(30, EventKind::FileChanged, None),
+            sample_event(90, EventKind::DnsQuery, None),
+        ];
+        s.append_events(&evs).unwrap();
+
+        // Window excludes t=90.
+        let in_window = s.events_in_window(ns(0), ns(50), None, 100).unwrap();
+        assert_eq!(in_window.len(), 3);
+
+        // Kind filter keeps only DNS.
+        let dns_only = s
+            .events_in_window(ns(0), ns(50), Some(&[EventKind::DnsQuery]), 100)
+            .unwrap();
+        assert_eq!(dns_only.len(), 2);
+        assert!(dns_only.iter().all(|e| e.kind == EventKind::DnsQuery));
+
+        // Limit caps output (oldest first).
+        let capped = s.events_in_window(ns(0), ns(100), None, 1).unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(
+            capped[0].payload.get("marker").and_then(|v| v.as_u64()),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn prune_deletes_old_events_and_summary_counts_them() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.append_events(&[
+            sample_event(10, EventKind::DnsQuery, None),
+            sample_event(50, EventKind::DnsQuery, None),
+        ])
+        .unwrap();
+        assert_eq!(s.summary().unwrap().event_count, 2);
+
+        let report = s.prune_before(ns(30)).unwrap();
+        assert_eq!(report.events_deleted, 1);
+        assert_eq!(s.summary().unwrap().event_count, 1);
+        let left = s.events_in_window(ns(0), ns(100), None, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            left[0].payload.get("marker").and_then(|v| v.as_u64()),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn meta_round_trip_and_schema_version_guard() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.get_meta("daemon_pid").unwrap(), None);
+        s.set_meta("daemon_pid", "1234").unwrap();
+        assert_eq!(s.get_meta("daemon_pid").unwrap().as_deref(), Some("1234"));
+        // Overwrite wins.
+        s.set_meta("daemon_pid", "5678").unwrap();
+        assert_eq!(s.get_meta("daemon_pid").unwrap().as_deref(), Some("5678"));
+        // The store's own key is protected.
+        assert!(s.set_meta("schema_version", "99").is_err());
+        assert_eq!(s.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn two_connections_share_one_file_store() {
+        // Simulates the daemon (writer) + aw-query (reader) racing on the
+        // same world.db: WAL + busy timeout must let the read succeed while
+        // a second connection is open.
+        let path =
+            std::env::temp_dir().join(format!("aw-store-wal-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = Store::open(&path).unwrap();
+        let reader = Store::open(&path).unwrap();
+
+        writer.merge_graph(&small_graph()).unwrap();
+        writer
+            .append_events(&[sample_event(10, EventKind::DnsQuery, None)])
+            .unwrap();
+
+        let loaded = reader.load_graph().unwrap();
+        assert_eq!(loaded.processes.len(), 2);
+        assert_eq!(reader.summary().unwrap().event_count, 1);
+
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        // WAL sidecar files.
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
     #[test]
     fn frontmost_during_edge_preserves_overlap() {
         let mut s = Store::open_in_memory().unwrap();
-        let proc_id = ProcessId { pid: 100, start_unix_secs: 1 };
+        let proc_id = ProcessId {
+            pid: 100,
+            start_unix_secs: 1,
+        };
         let g = Graph {
             processes: vec![ProcessNode {
                 id: proc_id.clone(),
@@ -1423,21 +2568,36 @@ mod tests {
                 id: "com.app.X".into(),
                 name: Some("X".into()),
                 exec_path: None,
-                intervals: vec![Interval { from: ts(5), to: Some(ts(50)) }],
+                intervals: vec![Interval {
+                    from: ts(5),
+                    to: Some(ts(50)),
+                }],
             }],
             sockets: vec![],
             files: vec![],
+            domains: vec![],
             edges: vec![Edge::FrontmostDuring {
                 app: "com.app.X".into(),
                 process: proc_id.clone(),
-                overlap: Interval { from: ts(10), to: Some(ts(50)) },
+                overlap: Interval {
+                    from: ts(10),
+                    to: Some(ts(50)),
+                },
             }],
         };
         s.merge_graph(&g).unwrap();
         let loaded = s.load_graph().unwrap();
-        let fd = loaded.edges.iter().find(|e| matches!(e, Edge::FrontmostDuring { .. })).unwrap();
+        let fd = loaded
+            .edges
+            .iter()
+            .find(|e| matches!(e, Edge::FrontmostDuring { .. }))
+            .unwrap();
         match fd {
-            Edge::FrontmostDuring { app, process, overlap } => {
+            Edge::FrontmostDuring {
+                app,
+                process,
+                overlap,
+            } => {
                 assert_eq!(app, "com.app.X");
                 assert_eq!(process.pid, 100);
                 assert_eq!(overlap.from.mono_ns, 10);

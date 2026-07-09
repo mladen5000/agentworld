@@ -38,7 +38,9 @@ fn parse_args() -> Result<Args> {
                 out_dir = Some(PathBuf::from(v));
             }
             "--persist" => {
-                let v = args.next().context("--persist requires a path to a sqlite db file")?;
+                let v = args
+                    .next()
+                    .context("--persist requires a path to a sqlite db file")?;
                 persist = Some(PathBuf::from(v));
             }
             "-h" | "--help" => {
@@ -77,9 +79,13 @@ fn main() -> Result<()> {
     loop {
         line.clear();
         let n = reader.read_line(&mut line)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         let value: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
@@ -92,13 +98,25 @@ fn main() -> Result<()> {
 
         if value.get("source").is_some() {
             match serde_json::from_value::<Observation>(value) {
-                Ok(obs) => { builder.on_observation(&obs); obs_count += 1; }
-                Err(e) => { tracing::warn!("skipping malformed Observation: {e}"); skipped += 1; }
+                Ok(obs) => {
+                    builder.on_observation(&obs);
+                    obs_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("skipping malformed Observation: {e}");
+                    skipped += 1;
+                }
             }
         } else if value.get("kind").is_some() {
             match serde_json::from_value::<Event>(value) {
-                Ok(ev) => { builder.on_event(&ev); ev_count += 1; }
-                Err(e) => { tracing::warn!("skipping malformed Event: {e}"); skipped += 1; }
+                Ok(ev) => {
+                    builder.on_event(&ev);
+                    ev_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("skipping malformed Event: {e}");
+                    skipped += 1;
+                }
             }
         } else {
             skipped += 1;
@@ -116,9 +134,26 @@ fn main() -> Result<()> {
     std::fs::write(&json_path, &json_src)
         .with_context(|| format!("writing {}", json_path.display()))?;
 
-    let parent_of = graph.edges.iter().filter(|e| matches!(e, aw_graph::Edge::ParentOf { .. })).count();
-    let frontmost_during = graph.edges.iter().filter(|e| matches!(e, aw_graph::Edge::FrontmostDuring { .. })).count();
-    let opened_socket = graph.edges.iter().filter(|e| matches!(e, aw_graph::Edge::OpenedSocket { .. })).count();
+    let parent_of = graph
+        .edges
+        .iter()
+        .filter(|e| matches!(e, aw_graph::Edge::ParentOf { .. }))
+        .count();
+    let frontmost_during = graph
+        .edges
+        .iter()
+        .filter(|e| matches!(e, aw_graph::Edge::FrontmostDuring { .. }))
+        .count();
+    let opened_socket = graph
+        .edges
+        .iter()
+        .filter(|e| matches!(e, aw_graph::Edge::OpenedSocket { .. }))
+        .count();
+    let queried_domain = graph
+        .edges
+        .iter()
+        .filter(|e| matches!(e, aw_graph::Edge::QueriedDomain { .. }))
+        .count();
 
     let mut stderr = std::io::stderr().lock();
     writeln!(
@@ -127,17 +162,23 @@ fn main() -> Result<()> {
     )?;
     writeln!(
         stderr,
-        "aw-graph: built {} processes, {} apps, {} sockets, {} files",
+        "aw-graph: built {} processes, {} apps, {} sockets, {} files, {} domains",
         graph.processes.len(),
         graph.apps.len(),
         graph.sockets.len(),
         graph.files.len(),
+        graph.domains.len(),
     )?;
     writeln!(
         stderr,
-        "aw-graph: edges: {parent_of} parent_of, {frontmost_during} frontmost_during, {opened_socket} opened_socket",
+        "aw-graph: edges: {parent_of} parent_of, {frontmost_during} frontmost_during, {opened_socket} opened_socket, {queried_domain} queried_domain",
     )?;
-    writeln!(stderr, "aw-graph: wrote {} and {}", dot_path.display(), json_path.display())?;
+    writeln!(
+        stderr,
+        "aw-graph: wrote {} and {}",
+        dot_path.display(),
+        json_path.display()
+    )?;
 
     if let Some(db_path) = args.persist.as_ref() {
         // SQLite needs the parent directory to exist; create it for the user.
@@ -149,14 +190,17 @@ fn main() -> Result<()> {
         }
         let mut store = Store::open(db_path)
             .with_context(|| format!("opening store at {}", db_path.display()))?;
-        let report = store.merge_graph(&graph)
+        let report = store
+            .merge_graph(&graph)
             .with_context(|| "merging graph into store")?;
         writeln!(
             stderr,
             "aw-graph: persisted to {}: nodes +{}/~{}, edges +{}/~{}",
             db_path.display(),
-            report.nodes_inserted, report.nodes_updated,
-            report.edges_inserted, report.edges_updated,
+            report.nodes_inserted,
+            report.nodes_updated,
+            report.edges_inserted,
+            report.edges_updated,
         )?;
     }
 

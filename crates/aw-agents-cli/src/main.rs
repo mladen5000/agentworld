@@ -6,6 +6,7 @@
 //!   aw-agents process-anomaly  --graph ./out/graph.json
 //!   aw-agents process-anomaly  --store ./world.db
 //!   aw-agents network-review   < events.ndjson
+//!   aw-agents dns-review       < events.ndjson
 //!
 //! All subcommands accept `--model <name>` (default `gemma3:4b`),
 //! `--ollama-url <url>` (default `http://127.0.0.1:11434`),
@@ -23,6 +24,7 @@ enum Subcommand {
     Timeline,
     ProcessAnomaly,
     NetworkReview,
+    DnsReview,
 }
 
 struct Args {
@@ -37,11 +39,14 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut iter = std::env::args().skip(1);
-    let sub = iter.next().ok_or_else(|| anyhow!("missing subcommand (timeline|process-anomaly|network-review)"))?;
+    let sub = iter.next().ok_or_else(|| {
+        anyhow!("missing subcommand (timeline|process-anomaly|network-review|dns-review)")
+    })?;
     let subcommand = match sub.as_str() {
         "timeline" => Subcommand::Timeline,
         "process-anomaly" => Subcommand::ProcessAnomaly,
         "network-review" => Subcommand::NetworkReview,
+        "dns-review" => Subcommand::DnsReview,
         "-h" | "--help" => {
             print_usage();
             std::process::exit(0);
@@ -60,19 +65,38 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--model" => model = iter.next().context("--model requires a value")?,
             "--ollama-url" => ollama_url = iter.next().context("--ollama-url requires a value")?,
-            "--graph" => graph_path = Some(PathBuf::from(iter.next().context("--graph requires a path")?)),
-            "--store" => store_path = Some(PathBuf::from(iter.next().context("--store requires a path")?)),
+            "--graph" => {
+                graph_path = Some(PathBuf::from(
+                    iter.next().context("--graph requires a path")?,
+                ))
+            }
+            "--store" => {
+                store_path = Some(PathBuf::from(
+                    iter.next().context("--store requires a path")?,
+                ))
+            }
             "--pretty" => pretty = true,
             "--max-items" => {
                 let s = iter.next().context("--max-items requires a value")?;
                 max_input_items = s.parse().context("--max-items must be an integer")?;
             }
-            "-h" | "--help" => { print_usage(); std::process::exit(0); }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
 
-    Ok(Args { subcommand, model, ollama_url, graph_path, store_path, pretty, max_input_items })
+    Ok(Args {
+        subcommand,
+        model,
+        ollama_url,
+        graph_path,
+        store_path,
+        pretty,
+        max_input_items,
+    })
 }
 
 fn print_usage() {
@@ -82,6 +106,7 @@ fn print_usage() {
     eprintln!("  timeline           reads NDJSON events from stdin");
     eprintln!("  process-anomaly    reads --graph <path> OR --store <db-path>");
     eprintln!("  network-review     reads NDJSON events from stdin");
+    eprintln!("  dns-review         reads NDJSON events from stdin");
     eprintln!();
     eprintln!("options:");
     eprintln!("  --model <name>           default: gemma3:4b");
@@ -114,7 +139,9 @@ async fn main() -> Result<()> {
         Subcommand::Timeline => {
             let events = aw_agents::input::read_events(std::io::stdin())?;
             eprintln!("aw-agents: read {} events from stdin", events.len());
-            aw_agents::timeline_narrator::TimelineNarrator::new(ctx).run(&events).await?
+            aw_agents::timeline_narrator::TimelineNarrator::new(ctx)
+                .run(&events)
+                .await?
         }
         Subcommand::ProcessAnomaly => {
             let detector = aw_agents::process_anomaly::ProcessAnomalyDetector::new(ctx);
@@ -122,7 +149,11 @@ async fn main() -> Result<()> {
                 (Some(_), Some(_)) => bail!("--graph and --store are mutually exclusive"),
                 (Some(p), None) => {
                     let g = aw_agents::input::read_graph(p)?;
-                    eprintln!("aw-agents: read graph from {} with {} processes", p.display(), g.processes.len());
+                    eprintln!(
+                        "aw-agents: read graph from {} with {} processes",
+                        p.display(),
+                        g.processes.len()
+                    );
                     detector.run(&g).await?
                 }
                 (None, Some(p)) => {
@@ -131,16 +162,30 @@ async fn main() -> Result<()> {
                     // matched, never the full process list.
                     let store = aw_store::Store::open(p)
                         .with_context(|| format!("opening store at {}", p.display()))?;
-                    eprintln!("aw-agents: running suspicion queries against store {}", p.display());
+                    eprintln!(
+                        "aw-agents: running suspicion queries against store {}",
+                        p.display()
+                    );
                     detector.run_from_store(&store).await?
                 }
-                (None, None) => bail!("process-anomaly requires --graph <path> or --store <db-path>"),
+                (None, None) => {
+                    bail!("process-anomaly requires --graph <path> or --store <db-path>")
+                }
             }
         }
         Subcommand::NetworkReview => {
             let events = aw_agents::input::read_events(std::io::stdin())?;
             eprintln!("aw-agents: read {} events from stdin", events.len());
-            aw_agents::network_reviewer::NetworkReviewer::new(ctx).run(&events).await?
+            aw_agents::network_reviewer::NetworkReviewer::new(ctx)
+                .run(&events)
+                .await?
+        }
+        Subcommand::DnsReview => {
+            let events = aw_agents::input::read_events(std::io::stdin())?;
+            eprintln!("aw-agents: read {} events from stdin", events.len());
+            aw_agents::dns_reviewer::DnsReviewer::new(ctx)
+                .run(&events)
+                .await?
         }
     };
 

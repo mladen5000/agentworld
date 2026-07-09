@@ -10,6 +10,10 @@
 //!   child. Edges to parents not in our node set are dropped.
 //! - **`frontmost_during`** edges: app → process, for every pair whose lifetime
 //!   intervals overlap. Built at finalize time.
+//! - **Domain** nodes: id `qname` (trailing dot stripped; `hash:<name_hash>`
+//!   fallback for privacy-masked queries) — from Layer 2 `DnsQuery` events.
+//! - **`queried_domain`** edges: process → domain, attributed via the query's
+//!   pid using the same alive-at-timestamp resolution as `opened_socket`.
 //!
 //! ## Pragmatic shortcuts
 //!
@@ -23,9 +27,9 @@
 use std::collections::HashMap;
 
 use aw_core::{Observation, Timestamp};
-use aw_events::{Event, EventKind};
 #[cfg(test)]
 use aw_events::SCHEMA_VERSION;
+use aw_events::{Event, EventKind};
 use serde::{Deserialize, Serialize};
 
 pub mod dot;
@@ -84,6 +88,20 @@ pub struct FileNode {
     pub touch_count: u64, // sum of `count` fields across coalesced events
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainNode {
+    /// Queried name with a single trailing dot stripped, or `hash:<name_hash>`
+    /// when the qname was privacy-masked by mDNSResponder.
+    pub name: String,
+    /// Union of all query types observed for this name (A, AAAA, HTTPS, ...).
+    pub qtypes: Vec<String>,
+    /// True iff every observation of this name was privacy-masked.
+    pub masked: bool,
+    pub first_seen: Timestamp,
+    pub last_seen: Timestamp,
+    pub query_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Interval {
     pub from: Timestamp,
@@ -107,6 +125,12 @@ pub enum Edge {
         process: ProcessId,
         socket: SocketId,
     },
+    QueriedDomain {
+        process: ProcessId,
+        domain: String,
+        /// Number of queries this process issued for this name.
+        count: u64,
+    },
 }
 
 /// The materialized graph. Nodes and edges, both serializable.
@@ -116,6 +140,10 @@ pub struct Graph {
     pub apps: Vec<AppNode>,
     pub sockets: Vec<SocketNode>,
     pub files: Vec<FileNode>,
+    /// `serde(default)` so graph.json files written before domains existed
+    /// still deserialize.
+    #[serde(default)]
+    pub domains: Vec<DomainNode>,
     pub edges: Vec<Edge>,
 }
 
@@ -133,6 +161,10 @@ pub struct GraphBuilder {
     apps: HashMap<String, AppNode>,
     sockets: HashMap<SocketId, SocketNode>,
     files: HashMap<String, FileNode>,
+    domains: HashMap<String, DomainNode>,
+    /// Per-(pid, domain) query tallies, resolved to `queried_domain` edges at
+    /// build time (pid → ProcessId needs the full process set).
+    domain_queries: HashMap<(u32, String), DomainQueryAgg>,
     /// Currently-frontmost app id with the timestamp it became frontmost.
     /// Becomes `None` when the frontmost transitions to nothing.
     current_frontmost: Option<(String, Timestamp)>,
@@ -147,6 +179,8 @@ impl GraphBuilder {
             apps: HashMap::new(),
             sockets: HashMap::new(),
             files: HashMap::new(),
+            domains: HashMap::new(),
+            domain_queries: HashMap::new(),
             current_frontmost: None,
             last_ts: None,
         }
@@ -162,12 +196,12 @@ impl GraphBuilder {
             EventKind::ConnectionOpened => self.on_connection_opened(ev),
             EventKind::ConnectionClosed => self.on_connection_closed(ev),
             EventKind::FileChanged => self.on_file_changed(ev),
-            // DNS queries are not yet folded into the graph (no DomainName
-            // node type yet). `ConnectionCompleted` is a derived synthesis
-            // of data already captured by Opened+Closed, so the graph does
-            // not double-consume it. They still advance `last_ts` above so
-            // interval closure remains correct.
-            EventKind::DnsQuery | EventKind::ConnectionCompleted => {}
+            EventKind::DnsQuery => self.on_dns_query(ev),
+            // `ConnectionCompleted` is a derived synthesis of data already
+            // captured by Opened+Closed, so the graph does not double-consume
+            // it. It still advances `last_ts` above so interval closure
+            // remains correct.
+            EventKind::ConnectionCompleted => {}
         }
     }
 
@@ -386,6 +420,47 @@ impl GraphBuilder {
         }
     }
 
+    fn on_dns_query(&mut self, ev: &Event) {
+        let p = &ev.payload;
+        let masked = p.get("masked").and_then(|v| v.as_bool()).unwrap_or(false);
+        let Some(name) = domain_id_from_payload(p) else {
+            return;
+        };
+        let qtype = p.get("qtype").and_then(|v| v.as_str()).map(String::from);
+
+        let node = self
+            .domains
+            .entry(name.clone())
+            .or_insert_with(|| DomainNode {
+                name: name.clone(),
+                qtypes: Vec::new(),
+                masked,
+                first_seen: ev.timestamp,
+                last_seen: ev.timestamp,
+                query_count: 0,
+            });
+        node.last_seen = ev.timestamp;
+        node.query_count += 1;
+        // Any unmasked observation of the name clears the masked flag.
+        node.masked = node.masked && masked;
+        if let Some(q) = qtype {
+            if !node.qtypes.contains(&q) {
+                node.qtypes.push(q);
+            }
+        }
+
+        if let Some(pid) = ev.pid {
+            let agg = self
+                .domain_queries
+                .entry((pid, name))
+                .or_insert(DomainQueryAgg {
+                    count: 0,
+                    first_ts: ev.timestamp,
+                });
+            agg.count += 1;
+        }
+    }
+
     /// Finalize and produce the graph. Open intervals are closed at the latest
     /// timestamp we've observed.
     /// Materialize a `Graph` from the current builder state *without*
@@ -408,6 +483,8 @@ impl GraphBuilder {
     /// - Closed sockets (`closed = Some(c)` with `c < cutoff`) — same.
     /// - Files whose `last_seen < cutoff` — fsevent paths accumulate fast and
     ///   are the dominant unbounded growth in long-running daemons.
+    /// - Domains whose `last_seen < cutoff`, along with their pending
+    ///   per-(pid, domain) query tallies.
     ///
     /// Apps are *not* trimmed: they have low cardinality, stable identity,
     /// and dropping the currently-frontmost app would corrupt the open
@@ -431,10 +508,17 @@ impl GraphBuilder {
         });
         let before_f = self.files.len();
         self.files.retain(|_, f| f.last_seen.mono_ns >= cutoff_ns);
+        let before_d = self.domains.len();
+        self.domains.retain(|_, d| d.last_seen.mono_ns >= cutoff_ns);
+        // Drop tallies for trimmed domains so this map doesn't grow forever.
+        let domains = &self.domains;
+        self.domain_queries
+            .retain(|(_, name), _| domains.contains_key(name));
 
         (before_p - self.processes.len())
             + (before_s - self.sockets.len())
             + (before_f - self.files.len())
+            + (before_d - self.domains.len())
     }
 
     pub fn build(mut self) -> Graph {
@@ -455,6 +539,7 @@ impl GraphBuilder {
         let apps: Vec<AppNode> = self.apps.values().cloned().collect();
         let sockets: Vec<SocketNode> = self.sockets.values().cloned().collect();
         let files: Vec<FileNode> = self.files.values().cloned().collect();
+        let domains: Vec<DomainNode> = self.domains.values().cloned().collect();
 
         let mut edges = Vec::new();
 
@@ -534,11 +619,35 @@ impl GraphBuilder {
             }
         }
 
+        // queried_domain edges: same pid-resolution rule as opened_socket —
+        // among processes with the matching pid whose lifetime covers the
+        // first query, take the most-recently-born (right one under pid reuse).
+        for ((pid, name), agg) in &self.domain_queries {
+            if !self.domains.contains_key(name) {
+                continue; // domain was trimmed after the tally was recorded
+            }
+            let candidates = processes.iter().filter(|p| {
+                p.id.pid == *pid
+                    && p.birth.mono_ns <= agg.first_ts.mono_ns
+                    && p.death
+                        .map(|d| d.mono_ns >= agg.first_ts.mono_ns)
+                        .unwrap_or(true)
+            });
+            if let Some(proc) = candidates.max_by_key(|p| p.birth.mono_ns) {
+                edges.push(Edge::QueriedDomain {
+                    process: proc.id.clone(),
+                    domain: name.clone(),
+                    count: agg.count,
+                });
+            }
+        }
+
         Graph {
             processes,
             apps,
             sockets,
             files,
+            domains,
             edges,
         }
     }
@@ -547,6 +656,29 @@ impl GraphBuilder {
 impl Default for GraphBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-(pid, domain) tally accumulated while streaming, resolved to a
+/// `queried_domain` edge at build time.
+#[derive(Clone)]
+struct DomainQueryAgg {
+    count: u64,
+    first_ts: Timestamp,
+}
+
+/// Canonical domain-node id for a `dns_query` payload: the qname with one
+/// trailing dot stripped, or `hash:<name_hash>` for privacy-masked queries
+/// that carry no usable name. Returns `None` when neither is present.
+fn domain_id_from_payload(p: &serde_json::Value) -> Option<String> {
+    let masked = p.get("masked").and_then(|v| v.as_bool()).unwrap_or(false);
+    match p.get("qname").and_then(|v| v.as_str()) {
+        Some(q) if !q.is_empty() && !masked => Some(q.strip_suffix('.').unwrap_or(q).to_string()),
+        _ => p
+            .get("name_hash")
+            .and_then(|v| v.as_str())
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("hash:{h}")),
     }
 }
 
@@ -905,11 +1037,107 @@ mod tests {
         assert!(!paths.contains(&"/tmp/old"));
     }
 
+    fn dns(pid: u32, qname: Option<&str>, qtype: &str, masked: bool, mono: u64) -> Event {
+        Event {
+            schema_version: SCHEMA_VERSION,
+            timestamp: ts(mono),
+            kind: EventKind::DnsQuery,
+            pid: Some(pid),
+            payload: json!({
+                "qname": qname,
+                "qtype": qtype,
+                "name_hash": "abc123",
+                "masked": masked,
+                "client_process_name": "test",
+            }),
+        }
+    }
+
+    #[test]
+    fn dns_query_creates_domain_node_and_strips_trailing_dot() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&dns(100, Some("example.com."), "A", false, 10));
+        b.on_event(&dns(100, Some("example.com."), "AAAA", false, 20));
+        let g = b.build();
+        assert_eq!(g.domains.len(), 1);
+        let d = &g.domains[0];
+        assert_eq!(d.name, "example.com");
+        assert_eq!(d.query_count, 2);
+        assert!(d.qtypes.contains(&"A".to_string()));
+        assert!(d.qtypes.contains(&"AAAA".to_string()));
+        assert_eq!(d.first_seen, ts(10));
+        assert_eq!(d.last_seen, ts(20));
+        assert!(!d.masked);
+    }
+
+    #[test]
+    fn masked_dns_query_falls_back_to_name_hash() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&dns(100, Some("<mask.hash: 'xxx=='>"), "A", true, 10));
+        let g = b.build();
+        assert_eq!(g.domains.len(), 1);
+        assert_eq!(g.domains[0].name, "hash:abc123");
+        assert!(g.domains[0].masked);
+    }
+
+    #[test]
+    fn queried_domain_edge_built_when_process_present() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&birth(100, 1000, "curl", 1, 10));
+        b.on_event(&dns(100, Some("example.com."), "A", false, 20));
+        b.on_event(&dns(100, Some("example.com."), "AAAA", false, 21));
+        let g = b.build();
+        let edges: Vec<_> = g
+            .edges
+            .iter()
+            .filter_map(|e| match e {
+                Edge::QueriedDomain {
+                    process,
+                    domain,
+                    count,
+                } => Some((process.pid, domain.as_str(), *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edges, vec![(100, "example.com", 2)]);
+    }
+
+    #[test]
+    fn queried_domain_edge_dropped_when_process_absent() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&dns(999, Some("example.com."), "A", false, 20));
+        let g = b.build();
+        assert_eq!(g.domains.len(), 1, "domain node still materializes");
+        assert!(!g
+            .edges
+            .iter()
+            .any(|e| matches!(e, Edge::QueriedDomain { .. })));
+    }
+
+    #[test]
+    fn trim_before_drops_quiescent_domains() {
+        let mut b = GraphBuilder::new();
+        b.on_event(&dns(100, Some("old.example."), "A", false, 1_000));
+        b.on_event(&dns(100, Some("recent.example."), "A", false, 5_000));
+        let trimmed = b.trim_before(ts(3_000));
+        assert_eq!(trimmed, 1);
+        let g = b.snapshot();
+        let names: Vec<&str> = g.domains.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"recent.example"));
+        assert!(!names.contains(&"old.example"));
+    }
+
     #[test]
     fn trim_before_keeps_open_sockets() {
         let mut b = GraphBuilder::new();
         // Only "opened" — never closed. Should always remain regardless of cutoff.
-        b.on_event(&conn_open(42, "tcp4", "10.0.0.1.50000", "1.2.3.4.443", 1_000));
+        b.on_event(&conn_open(
+            42,
+            "tcp4",
+            "10.0.0.1.50000",
+            "1.2.3.4.443",
+            1_000,
+        ));
         let trimmed = b.trim_before(ts(1_000_000_000));
         assert_eq!(trimmed, 0);
         let g = b.snapshot();

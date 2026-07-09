@@ -378,7 +378,7 @@ mod tests {
         let curl = proc(400, "curl", "/usr/bin/curl", Some(100), 501);
         Graph {
             processes: vec![init.clone(), shell.clone(), escalated.clone(), weird.clone(), curl.clone()],
-            apps: vec![], sockets: vec![], files: vec![],
+            apps: vec![], sockets: vec![], files: vec![], domains: vec![],
             edges: vec![
                 parent_of(&init, &shell),
                 parent_of(&shell, &escalated),
@@ -460,7 +460,7 @@ mod tests {
         let curl = proc(2, "curl", "/usr/bin/curl", Some(1), 501);
         let g = Graph {
             processes: vec![init.clone(), curl.clone()],
-            apps: vec![], sockets: vec![], files: vec![],
+            apps: vec![], sockets: vec![], files: vec![], domains: vec![],
             edges: vec![parent_of(&init, &curl)],
         };
         let report = agent.run(&g).await.unwrap();
