@@ -30,13 +30,19 @@ impl SystemAdapter {
 }
 
 impl Default for SystemAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for SystemAdapter {
-    fn source(&self) -> Source { Source::System }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Snapshot }
+    fn source(&self) -> Source {
+        Source::System
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Snapshot
+    }
 
     async fn poll_snapshot(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         #[cfg(target_os = "macos")]
@@ -52,7 +58,8 @@ impl SourceAdapter for SystemAdapter {
                     payload,
                     tags: None,
                 });
-            }).await;
+            })
+            .await;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -113,7 +120,11 @@ mod imp {
         // and provide a 3-element array. The return is the number of entries
         // populated, or -1 on failure.
         let n = unsafe { libc::getloadavg(avgs.as_mut_ptr(), 3) };
-        if n == 3 { Some(avgs) } else { None }
+        if n == 3 {
+            Some(avgs)
+        } else {
+            None
+        }
     }
 
     fn read_string(name: &str) -> Option<String> {

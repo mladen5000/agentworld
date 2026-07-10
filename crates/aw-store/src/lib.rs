@@ -121,6 +121,49 @@ pub struct DomainSummary {
     pub last_seen_unix_ns: i64,
 }
 
+/// Per-kind cap on [`Store::novel_since`] result lists. Novelty feeds prose;
+/// past ~20 items per kind the narrator would truncate anyway.
+pub const NOVELTY_CAP_PER_KIND: usize = 20;
+
+/// A never-before-seen process *identity* — process node rows are one per
+/// run (`pid:start_secs`), so novelty collapses them by `(comm, exec_path)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewProcessIdentity {
+    pub comm: Option<String>,
+    pub exec_path: Option<String>,
+    pub first_seen_unix_ns: i64,
+    /// Node rows collapsed into this identity (≥ 1).
+    pub instances: u32,
+}
+
+/// A foreign endpoint whose *earliest* socket falls after the cutoff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewEndpoint {
+    pub foreign_addr: String,
+    pub example_process: Option<String>,
+    pub first_seen_unix_ns: i64,
+    pub socket_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewApp {
+    pub id: String,
+    pub name: Option<String>,
+}
+
+/// Result of [`Store::novel_since`]: entities first seen at/after the cutoff.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct NoveltyReport {
+    pub new_processes: Vec<NewProcessIdentity>,
+    pub new_domains: Vec<String>,
+    pub new_endpoints: Vec<NewEndpoint>,
+    pub new_apps: Vec<NewApp>,
+    /// `MIN(first_seen)` across ALL nodes; `None` when the store is empty.
+    /// Callers use this to detect a cold baseline — when history barely
+    /// predates the cutoff, "first time ever seen" is not a meaningful claim.
+    pub oldest_first_seen_unix_ns: Option<i64>,
+}
+
 /// Result of [`Store::prune_before`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PruneReport {
@@ -732,17 +775,21 @@ impl Store {
     ///
     /// The join is across the `parent_of` edge table; uid comparison happens
     /// on the JSON `attrs` payload of each end.
-    pub fn processes_root_under_user_parent(&self) -> Result<Vec<ProcessNode>> {
+    ///
+    /// `since_unix_ns` restricts to children active at/after that time
+    /// (their `last_seen` column); pass `0` for all-time.
+    pub fn processes_root_under_user_parent(&self, since_unix_ns: i64) -> Result<Vec<ProcessNode>> {
         let mut stmt = self.conn.prepare(
             "SELECT child.id, child.attrs, child.first_seen, child.last_seen
              FROM edges e
              JOIN nodes child  ON child.kind  = 'process' AND child.id  = e.to_id
              JOIN nodes parent ON parent.kind = 'process' AND parent.id = e.from_id
              WHERE e.kind = 'parent_of'
+               AND child.last_seen >= ?1
                AND CAST(json_extract(child.attrs,  '$.uid') AS INTEGER) = 0
                AND CAST(json_extract(parent.attrs, '$.uid') AS INTEGER) > 0",
         )?;
-        let rows = stmt.query_map([], row_to_process_tuple)?;
+        let rows = stmt.query_map(params![since_unix_ns], row_to_process_tuple)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(process_from_row(row?)?);
@@ -758,11 +805,22 @@ impl Store {
     /// Processes with no `exec_path` at all are returned (we can't vouch for
     /// them either). Empty `allowed_prefixes` is treated as "everything is
     /// untrusted" and returns every process with an exec_path.
-    pub fn processes_outside_paths(&self, allowed_prefixes: &[&str]) -> Result<Vec<ProcessNode>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, attrs, first_seen, last_seen FROM nodes WHERE kind = 'process'")?;
-        let rows = stmt.query_map([], row_to_process_tuple)?;
+    ///
+    /// `since_unix_ns` restricts to processes active at/after that time.
+    /// Filtered on the raw `last_seen` column — `ProcessNode` doesn't carry
+    /// it, and `death` is `None` for still-alive processes, so a node-level
+    /// filter would wrongly drop active long-lived processes. Pass `0` for
+    /// all-time.
+    pub fn processes_outside_paths(
+        &self,
+        allowed_prefixes: &[&str],
+        since_unix_ns: i64,
+    ) -> Result<Vec<ProcessNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, attrs, first_seen, last_seen FROM nodes
+             WHERE kind = 'process' AND last_seen >= ?1",
+        )?;
+        let rows = stmt.query_map(params![since_unix_ns], row_to_process_tuple)?;
         let mut out = Vec::new();
         for row in rows {
             let tuple = row?;
@@ -1182,17 +1240,27 @@ impl Store {
     ///
     /// Returns `(parent_process, child_count)` pairs, sorted by descending
     /// child count.
-    pub fn parents_with_many_children(&self, min_children: u32) -> Result<Vec<(ProcessNode, u32)>> {
+    ///
+    /// `since_unix_ns` counts only children active at/after that time (their
+    /// `last_seen` column), so a long-lived parent isn't flagged forever on
+    /// the strength of children it spawned hours ago. Pass `0` for all-time.
+    pub fn parents_with_many_children(
+        &self,
+        min_children: u32,
+        since_unix_ns: i64,
+    ) -> Result<Vec<(ProcessNode, u32)>> {
         let mut stmt = self.conn.prepare(
             "SELECT parent.id, parent.attrs, parent.first_seen, parent.last_seen, COUNT(*) AS n
              FROM edges e
              JOIN nodes parent ON parent.kind = 'process' AND parent.id = e.from_id
+             JOIN nodes child  ON child.kind  = 'process' AND child.id  = e.to_id
              WHERE e.kind = 'parent_of'
+               AND child.last_seen >= ?2
              GROUP BY parent.id
              HAVING n >= ?1
              ORDER BY n DESC",
         )?;
-        let rows = stmt.query_map(params![min_children], |r| {
+        let rows = stmt.query_map(params![min_children, since_unix_ns], |r| {
             let id: String = r.get(0)?;
             let attrs: String = r.get(1)?;
             let first_seen: i64 = r.get(2)?;
@@ -1237,6 +1305,117 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Entities whose first-ever `first_seen` is at/after `from_unix_ns` —
+    /// i.e. never observed before that moment. Correct because `upsert_node`
+    /// maintains `first_seen` with `MIN()`, so a re-observed entity keeps its
+    /// original first sighting and can never re-qualify as new.
+    ///
+    /// The novelty horizon equals the retention horizon: an entity pruned by
+    /// `prune_before` and later re-observed legitimately reports as new
+    /// ("new within the retention window") — intended semantics.
+    ///
+    /// Lists are capped at [`NOVELTY_CAP_PER_KIND`], oldest first.
+    pub fn novel_since(&self, from_unix_ns: i64) -> Result<NoveltyReport> {
+        let cap = NOVELTY_CAP_PER_KIND as i64;
+        let mut report = NoveltyReport::default();
+
+        // Process node ids are one row per run (pid:start_secs), so collapse
+        // by identity; the identity is new only if its EARLIEST run is.
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(attrs, '$.comm')      AS comm,
+                    json_extract(attrs, '$.exec_path') AS exec_path,
+                    MIN(first_seen)                    AS first_ever,
+                    COUNT(*)                           AS instances
+             FROM nodes
+             WHERE kind = 'process'
+             GROUP BY comm, exec_path
+             HAVING MIN(first_seen) >= ?1
+                AND (comm IS NOT NULL OR exec_path IS NOT NULL)
+             ORDER BY first_ever ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns, cap], |r| {
+            Ok(NewProcessIdentity {
+                comm: r.get(0)?,
+                exec_path: r.get(1)?,
+                first_seen_unix_ns: r.get(2)?,
+                instances: r.get::<_, i64>(3)?.max(0) as u32,
+            })
+        })?;
+        for row in rows {
+            report.new_processes.push(row?);
+        }
+
+        // Domain node ids ARE the name and are stable per name, so the
+        // node's own first_seen suffices. Masked names are hashes — noise in
+        // prose — so they're excluded.
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM nodes
+             WHERE kind = 'domain'
+               AND first_seen >= ?1
+               AND COALESCE(json_extract(attrs, '$.masked'), 0) = 0
+             ORDER BY first_seen ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns, cap], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            report.new_domains.push(row?);
+        }
+
+        // Socket node ids are PER-CONNECTION (proto|local|foreign): a repeat
+        // connection to a known host creates a brand-new node with a fresh
+        // first_seen. Group by the foreign endpoint and take MIN over the
+        // group — the endpoint is new only if its earliest socket is.
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(attrs, '$.foreign_addr')      AS fa,
+                    MIN(first_seen)                            AS first_ever,
+                    COUNT(*)                                   AS socket_count,
+                    MAX(json_extract(attrs, '$.process_name')) AS example_process
+             FROM nodes
+             WHERE kind = 'socket'
+               AND json_extract(attrs, '$.foreign_addr') IS NOT NULL
+             GROUP BY fa
+             HAVING MIN(first_seen) >= ?1
+             ORDER BY first_ever ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns, cap], |r| {
+            Ok(NewEndpoint {
+                foreign_addr: r.get(0)?,
+                first_seen_unix_ns: r.get(1)?,
+                socket_count: r.get::<_, i64>(2)?.max(0) as u32,
+                example_process: r.get(3)?,
+            })
+        })?;
+        for row in rows {
+            report.new_endpoints.push(row?);
+        }
+
+        // App ids are bundle ids — stable per app.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, json_extract(attrs, '$.name') AS name
+             FROM nodes
+             WHERE kind = 'app' AND first_seen >= ?1
+             ORDER BY first_seen ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns, cap], |r| {
+            Ok(NewApp {
+                id: r.get(0)?,
+                name: r.get(1)?,
+            })
+        })?;
+        for row in rows {
+            report.new_apps.push(row?);
+        }
+
+        report.oldest_first_seen_unix_ns =
+            self.conn
+                .query_row("SELECT MIN(first_seen) FROM nodes", [], |r| r.get(0))?;
+
+        Ok(report)
     }
 
     /// Append Layer 2 events to the durable history table. Unlike the graph
@@ -1888,7 +2067,7 @@ mod tests {
     fn root_under_user_parent_finds_only_the_escalation() {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&suspicion_graph()).unwrap();
-        let hits = s.processes_root_under_user_parent().unwrap();
+        let hits = s.processes_root_under_user_parent(0).unwrap();
         assert_eq!(
             hits.len(),
             1,
@@ -1904,7 +2083,7 @@ mod tests {
         s.merge_graph(&suspicion_graph()).unwrap();
         // /sbin/, /bin/, /usr/bin/ all trusted — only /tmp/rooted should remain.
         let hits = s
-            .processes_outside_paths(&["/sbin/", "/bin/", "/usr/bin/"])
+            .processes_outside_paths(&["/sbin/", "/bin/", "/usr/bin/"], 0)
             .unwrap();
         assert_eq!(hits.len(), 1, "expected only /tmp/rooted; got {hits:?}");
         assert_eq!(hits[0].exec_path.as_deref(), Some("/tmp/rooted"));
@@ -1915,15 +2094,30 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         s.merge_graph(&suspicion_graph()).unwrap();
         // shell (pid 100) has 2 children; launchd (pid 1) has 1.
-        let hits = s.parents_with_many_children(2).unwrap();
+        let hits = s.parents_with_many_children(2, 0).unwrap();
         assert_eq!(hits.len(), 1, "only shell crosses threshold; got {hits:?}");
         assert_eq!(hits[0].0.id.pid, 100);
         assert_eq!(hits[0].1, 2);
         // Lower the bar — both parents qualify, sorted by child count desc.
-        let all = s.parents_with_many_children(1).unwrap();
+        let all = s.parents_with_many_children(1, 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0.id.pid, 100); // 2 children first
         assert_eq!(all[1].0.id.pid, 1); // then launchd with 1
+    }
+
+    #[test]
+    fn parents_with_many_children_since_counts_only_recent_children() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&suspicion_graph()).unwrap();
+        // Children's last_seen: rooted=3ns, curl=4ns, shell=2ns. From t=4 only
+        // curl still counts, so shell drops below a threshold of 2...
+        let hits = s.parents_with_many_children(2, 4).unwrap();
+        assert!(hits.is_empty(), "old children must not count: {hits:?}");
+        // ...but still qualifies at 1, on the strength of curl alone.
+        let hits = s.parents_with_many_children(1, 4).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.id.pid, 100);
+        assert_eq!(hits[0].1, 1);
     }
 
     // ---------- batch 2 query tests --------------------------------------
@@ -2605,5 +2799,299 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ---------- novelty tests ---------------------------------------------
+
+    /// Minimal graph with one of each novelty-relevant entity, all stamped
+    /// at `t_secs` (unix seconds, zero anchor — round-trip convention).
+    fn novelty_fixture(
+        pid: u32,
+        start: u64,
+        comm: &str,
+        local_port: u16,
+        foreign: &str,
+        domain: &str,
+        masked: bool,
+        app: &str,
+        t_secs: u64,
+    ) -> Graph {
+        let t = unix_ts(t_secs);
+        let p = ProcessNode {
+            id: ProcessId {
+                pid,
+                start_unix_secs: start,
+            },
+            comm: Some(comm.into()),
+            name: None,
+            exec_path: Some(format!("/usr/bin/{comm}")),
+            ppid: Some(1),
+            uid: Some(501),
+            birth: t,
+            death: None,
+        };
+        let sock = SocketNode {
+            id: SocketId {
+                proto: "tcp4".into(),
+                local_addr: format!("10.0.0.1.{local_port}"),
+                foreign_addr: foreign.into(),
+            },
+            state: Some("ESTABLISHED".into()),
+            process_name: Some(comm.into()),
+            pid_at_open: Some(pid),
+            opened: t,
+            closed: None,
+            rxbytes_last: Some(1),
+            txbytes_last: Some(1),
+        };
+        let d = DomainNode {
+            name: domain.into(),
+            qtypes: vec!["A".into()],
+            masked,
+            first_seen: t,
+            last_seen: t,
+            query_count: 1,
+        };
+        let a = AppNode {
+            id: app.into(),
+            name: Some(app.into()),
+            exec_path: None,
+            intervals: vec![Interval {
+                from: t,
+                to: Some(unix_ts(t_secs + 1)),
+            }],
+        };
+        Graph {
+            processes: vec![p],
+            apps: vec![a],
+            sockets: vec![sock],
+            files: vec![],
+            domains: vec![d],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn novel_since_empty_store_reports_nothing_and_no_baseline() {
+        let s = Store::open_in_memory().unwrap();
+        let r = s.novel_since(0).unwrap();
+        assert!(r.new_processes.is_empty());
+        assert!(r.new_domains.is_empty());
+        assert!(r.new_endpoints.is_empty());
+        assert!(r.new_apps.is_empty());
+        assert_eq!(r.oldest_first_seen_unix_ns, None);
+    }
+
+    #[test]
+    fn novel_since_only_reports_entities_first_seen_after_cutoff() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&novelty_fixture(
+            42,
+            1001,
+            "curl",
+            50000,
+            "1.1.1.1.443",
+            "old.example",
+            false,
+            "com.app.Old",
+            10,
+        ))
+        .unwrap();
+        s.merge_graph(&novelty_fixture(
+            43,
+            1002,
+            "newtool",
+            50001,
+            "9.9.9.9.443",
+            "new.example",
+            false,
+            "com.app.New",
+            100,
+        ))
+        .unwrap();
+
+        let r = s.novel_since(ns(50)).unwrap();
+        assert_eq!(r.new_processes.len(), 1, "{:?}", r.new_processes);
+        assert_eq!(r.new_processes[0].comm.as_deref(), Some("newtool"));
+        assert_eq!(r.new_domains, vec!["new.example".to_string()]);
+        assert_eq!(r.new_endpoints.len(), 1);
+        assert_eq!(r.new_endpoints[0].foreign_addr, "9.9.9.9.443");
+        assert_eq!(r.new_apps.len(), 1);
+        assert_eq!(r.new_apps[0].id, "com.app.New");
+        assert_eq!(r.oldest_first_seen_unix_ns, Some(ns(10)));
+    }
+
+    #[test]
+    fn novel_since_dedupes_process_identity_across_pid_reuse() {
+        let mut s = Store::open_in_memory().unwrap();
+        // curl runs at t=10 (pid 42) and again at t=100 as a NEW node row
+        // (pid 99, new start time). Same identity -> not new after cutoff 50.
+        s.merge_graph(&novelty_fixture(
+            42,
+            1001,
+            "curl",
+            50000,
+            "1.1.1.1.443",
+            "a.example",
+            false,
+            "com.app.A",
+            10,
+        ))
+        .unwrap();
+        s.merge_graph(&novelty_fixture(
+            99,
+            2000,
+            "curl",
+            50002,
+            "1.1.1.1.443",
+            "a.example",
+            false,
+            "com.app.A",
+            100,
+        ))
+        .unwrap();
+
+        let r = s.novel_since(ns(50)).unwrap();
+        assert!(
+            r.new_processes.is_empty(),
+            "same (comm, exec_path) identity must not re-qualify: {:?}",
+            r.new_processes
+        );
+    }
+
+    #[test]
+    fn novel_since_groups_sockets_by_foreign_addr() {
+        let mut s = Store::open_in_memory().unwrap();
+        // t=10: connection to 1.1.1.1.443. t=100: a DIFFERENT socket node
+        // (fresh local port) to the same endpoint — endpoint is not new.
+        s.merge_graph(&novelty_fixture(
+            42,
+            1001,
+            "curl",
+            50000,
+            "1.1.1.1.443",
+            "a.example",
+            false,
+            "com.app.A",
+            10,
+        ))
+        .unwrap();
+        s.merge_graph(&novelty_fixture(
+            42,
+            1001,
+            "curl",
+            55555,
+            "1.1.1.1.443",
+            "a.example",
+            false,
+            "com.app.A",
+            100,
+        ))
+        .unwrap();
+
+        let r = s.novel_since(ns(50)).unwrap();
+        assert!(
+            r.new_endpoints.is_empty(),
+            "known endpoint via a fresh socket must not be new: {:?}",
+            r.new_endpoints
+        );
+    }
+
+    #[test]
+    fn novel_since_excludes_masked_domains() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&novelty_fixture(
+            42,
+            1001,
+            "curl",
+            50000,
+            "1.1.1.1.443",
+            "hash:abc==",
+            true,
+            "com.app.A",
+            100,
+        ))
+        .unwrap();
+        let r = s.novel_since(ns(50)).unwrap();
+        assert!(
+            r.new_domains.is_empty(),
+            "masked domains are noise: {:?}",
+            r.new_domains
+        );
+    }
+
+    #[test]
+    fn novel_since_respects_per_kind_cap() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut g = Graph::default();
+        for i in 0..25 {
+            g.domains.push(DomainNode {
+                name: format!("d{i}.example"),
+                qtypes: vec![],
+                masked: false,
+                first_seen: unix_ts(100 + i),
+                last_seen: unix_ts(100 + i),
+                query_count: 1,
+            });
+        }
+        s.merge_graph(&g).unwrap();
+        let r = s.novel_since(0).unwrap();
+        assert_eq!(r.new_domains.len(), NOVELTY_CAP_PER_KIND);
+        // Oldest first.
+        assert_eq!(r.new_domains[0], "d0.example");
+    }
+
+    #[test]
+    fn remerge_does_not_resurrect_novelty() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut g = novelty_fixture(
+            42,
+            1001,
+            "curl",
+            50000,
+            "1.1.1.1.443",
+            "a.example",
+            false,
+            "com.app.A",
+            10,
+        );
+        s.merge_graph(&g).unwrap();
+        // Same entities re-observed later: bump every timestamp to t=100 and
+        // re-merge. first_seen is MIN-maintained, so nothing becomes new.
+        g.processes[0].birth = unix_ts(100);
+        g.sockets[0].opened = unix_ts(100);
+        g.domains[0].first_seen = unix_ts(100);
+        g.domains[0].last_seen = unix_ts(100);
+        g.apps[0].intervals = vec![Interval {
+            from: unix_ts(100),
+            to: Some(unix_ts(101)),
+        }];
+        s.merge_graph(&g).unwrap();
+
+        let r = s.novel_since(ns(50)).unwrap();
+        assert!(r.new_processes.is_empty(), "{:?}", r.new_processes);
+        assert!(r.new_domains.is_empty(), "{:?}", r.new_domains);
+        assert!(r.new_endpoints.is_empty(), "{:?}", r.new_endpoints);
+        assert!(r.new_apps.is_empty(), "{:?}", r.new_apps);
+    }
+
+    #[test]
+    fn suspicion_queries_filter_by_last_seen_since() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.merge_graph(&suspicion_graph()).unwrap();
+        // suspicion_graph timestamps are raw mono ns 1..4 — since=0 sees all,
+        // a cutoff beyond them sees none.
+        assert_eq!(s.processes_root_under_user_parent(0).unwrap().len(), 1);
+        assert!(s
+            .processes_root_under_user_parent(1_000_000)
+            .unwrap()
+            .is_empty());
+
+        let trusted = ["/sbin/", "/bin/", "/usr/bin/"];
+        assert_eq!(s.processes_outside_paths(&trusted, 0).unwrap().len(), 1);
+        assert!(s
+            .processes_outside_paths(&trusted, 1_000_000)
+            .unwrap()
+            .is_empty());
     }
 }

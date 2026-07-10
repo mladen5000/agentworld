@@ -103,12 +103,17 @@ impl OllamaClient {
             .timeout(Duration::from_secs(300))
             .build()
             .expect("reqwest client build");
-        Self { base_url: url.into(), http }
+        Self {
+            base_url: url.into(),
+            http,
+        }
     }
 }
 
 impl Default for OllamaClient {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
@@ -119,7 +124,10 @@ impl LlmClient for OllamaClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::BadStatus { status: status.as_u16(), body });
+            return Err(LlmError::BadStatus {
+                status: status.as_u16(),
+                body,
+            });
         }
         let parsed: GenerateResponse = resp.json().await?;
         Ok(parsed)
@@ -177,23 +185,29 @@ mod tests {
     #[tokio::test]
     async fn mock_client_returns_queued_replies_in_order() {
         let m = mock::MockClient::new(vec!["first", "second"]);
-        let r1 = m.generate(GenerateRequest {
-            model: "test".into(),
-            prompt: "a".into(),
-            system: None,
-            options: None,
-            format: None,
-            stream: false,
-        }).await.unwrap();
+        let r1 = m
+            .generate(GenerateRequest {
+                model: "test".into(),
+                prompt: "a".into(),
+                system: None,
+                options: None,
+                format: None,
+                stream: false,
+            })
+            .await
+            .unwrap();
         assert_eq!(r1.response, "first");
-        let r2 = m.generate(GenerateRequest {
-            model: "test".into(),
-            prompt: "b".into(),
-            system: None,
-            options: None,
-            format: None,
-            stream: false,
-        }).await.unwrap();
+        let r2 = m
+            .generate(GenerateRequest {
+                model: "test".into(),
+                prompt: "b".into(),
+                system: None,
+                options: None,
+                format: None,
+                stream: false,
+            })
+            .await
+            .unwrap();
         assert_eq!(r2.response, "second");
         assert_eq!(m.calls().len(), 2);
     }
@@ -201,14 +215,17 @@ mod tests {
     #[tokio::test]
     async fn mock_client_returns_placeholder_when_exhausted() {
         let m = mock::MockClient::new(vec![]);
-        let r = m.generate(GenerateRequest {
-            model: "test".into(),
-            prompt: "a".into(),
-            system: None,
-            options: None,
-            format: None,
-            stream: false,
-        }).await.unwrap();
+        let r = m
+            .generate(GenerateRequest {
+                model: "test".into(),
+                prompt: "a".into(),
+                system: None,
+                options: None,
+                format: None,
+                stream: false,
+            })
+            .await
+            .unwrap();
         assert_eq!(r.response, "(no reply queued)");
     }
 
@@ -234,7 +251,11 @@ mod tests {
             model: "x".into(),
             prompt: "y".into(),
             system: Some("be brief".into()),
-            options: Some(Options { temperature: Some(0.2), num_predict: Some(256), num_ctx: Some(4096) }),
+            options: Some(Options {
+                temperature: Some(0.2),
+                num_predict: Some(256),
+                num_ctx: Some(4096),
+            }),
             format: Some(Format::Json),
             stream: false,
         };

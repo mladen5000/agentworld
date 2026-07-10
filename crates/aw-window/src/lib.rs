@@ -31,18 +31,26 @@ pub struct WindowAdapter {
 
 impl WindowAdapter {
     pub fn new() -> Self {
-        Self { prior: Mutex::new(None) }
+        Self {
+            prior: Mutex::new(None),
+        }
     }
 }
 
 impl Default for WindowAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for WindowAdapter {
-    fn source(&self) -> Source { Source::Window }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Diff }
+    fn source(&self) -> Source {
+        Source::Window
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Diff
+    }
 
     async fn poll_diff(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         let current = imp::read_frontmost();
@@ -58,7 +66,11 @@ impl SourceAdapter for WindowAdapter {
     }
 }
 
-fn to_observation(from: Option<&FrontmostApp>, to: &FrontmostApp, clock: &MonotonicClock) -> Observation {
+fn to_observation(
+    from: Option<&FrontmostApp>,
+    to: &FrontmostApp,
+    clock: &MonotonicClock,
+) -> Observation {
     Observation {
         timestamp: clock.now(),
         source: Source::Window,
@@ -94,12 +106,24 @@ mod imp {
             None => return FrontmostApp::default(),
         };
         let pid_raw = app.processIdentifier();
-        let pid = if pid_raw > 0 { Some(pid_raw as u32) } else { None };
+        let pid = if pid_raw > 0 {
+            Some(pid_raw as u32)
+        } else {
+            None
+        };
         let bundle_id = app.bundleIdentifier().map(|s| s.to_string());
         let name = app.localizedName().map(|s| s.to_string());
-        let exec_path = app.executableURL().and_then(|u| u.path()).map(|s| s.to_string());
+        let exec_path = app
+            .executableURL()
+            .and_then(|u| u.path())
+            .map(|s| s.to_string());
 
-        FrontmostApp { pid, bundle_id, name, exec_path }
+        FrontmostApp {
+            pid,
+            bundle_id,
+            name,
+            exec_path,
+        }
     }
 }
 
@@ -132,11 +156,20 @@ mod tests {
         let (bus, mut rx) = Bus::channel();
 
         adapter.poll_diff(clock.clone(), bus.clone()).await;
-        let obs = rx.try_recv().expect("first poll should emit one observation");
+        let obs = rx
+            .try_recv()
+            .expect("first poll should emit one observation");
         assert_eq!(obs.source, Source::Window);
-        assert_eq!(obs.payload.get("transition").and_then(|v| v.as_str()), Some("frontmost_app"));
+        assert_eq!(
+            obs.payload.get("transition").and_then(|v| v.as_str()),
+            Some("frontmost_app")
+        );
         // `from` should be null on the first observed transition.
-        assert!(obs.payload.get("from").map(|v| v.is_null()).unwrap_or(false));
+        assert!(obs
+            .payload
+            .get("from")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
     }
 
     #[tokio::test]
@@ -151,6 +184,9 @@ mod tests {
         while rx.try_recv().is_ok() {}
         // Second poll with no focus change: nothing should arrive.
         adapter.poll_diff(clock, bus).await;
-        assert!(rx.try_recv().is_err(), "second poll should emit nothing when focus is unchanged");
+        assert!(
+            rx.try_recv().is_err(),
+            "second poll should emit nothing when focus is unchanged"
+        );
     }
 }

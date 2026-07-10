@@ -79,7 +79,9 @@ impl ProcessLifecycle {
     /// and a new one is starting, so we finalize the diff before accumulating
     /// the new tick.
     pub fn on_observation(&mut self, obs: &Observation) -> Vec<Event> {
-        let Some(pid) = obs.pid else { return Vec::new(); };
+        let Some(pid) = obs.pid else {
+            return Vec::new();
+        };
         let p = &obs.payload;
         let start_unix_secs = match p.get("start_unix_secs").and_then(|v| v.as_u64()) {
             Some(s) => s,
@@ -94,13 +96,25 @@ impl ProcessLifecycle {
             }
         }
 
-        let key = ProcessKey { pid, start_unix_secs };
+        let key = ProcessKey {
+            pid,
+            start_unix_secs,
+        };
         let record = ProcessRecord {
             comm: p.get("comm").and_then(|v| v.as_str()).map(String::from),
             name: p.get("name").and_then(|v| v.as_str()).map(String::from),
-            ppid: p.get("ppid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
-            uid: p.get("uid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()),
-            exec_path: p.get("exec_path").and_then(|v| v.as_str()).map(String::from),
+            ppid: p
+                .get("ppid")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok()),
+            uid: p
+                .get("uid")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok()),
+            exec_path: p
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             start_unix_secs,
             last_seen: obs.timestamp,
         };
@@ -146,7 +160,9 @@ impl ProcessLifecycle {
 }
 
 impl Default for ProcessLifecycle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn birth_event(key: &ProcessKey, rec: &ProcessRecord) -> Event {
@@ -190,7 +206,12 @@ mod tests {
     use aw_core::{Observation, Source};
     use serde_json::json;
 
-    fn ts(mono: u64) -> Timestamp { Timestamp { mono_ns: mono, wall_anchor_ns: 0 } }
+    fn ts(mono: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: mono,
+            wall_anchor_ns: 0,
+        }
+    }
 
     fn obs(pid: u32, start: u64, comm: &str, mono: u64) -> Observation {
         Observation {
@@ -208,7 +229,10 @@ mod tests {
         s.on_observation(&obs(100, 1000, "init", 1));
         s.on_observation(&obs(200, 1001, "shell", 2));
         let events = s.on_tick_complete(ts(3));
-        assert!(events.is_empty(), "first tick must not emit births; got {events:?}");
+        assert!(
+            events.is_empty(),
+            "first tick must not emit births; got {events:?}"
+        );
     }
 
     #[test]
@@ -223,7 +247,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::ProcessBirth);
         assert_eq!(events[0].pid, Some(200));
-        assert_eq!(events[0].payload.get("comm").and_then(|v| v.as_str()), Some("new-proc"));
+        assert_eq!(
+            events[0].payload.get("comm").and_then(|v| v.as_str()),
+            Some("new-proc")
+        );
     }
 
     #[test]
@@ -304,8 +331,14 @@ mod tests {
         assert_eq!(kinds.len(), 2, "got {kinds:?}");
         assert!(kinds.contains(&EventKind::ProcessBirth));
         assert!(kinds.contains(&EventKind::ProcessDeath));
-        let death = events.iter().find(|e| e.kind == EventKind::ProcessDeath).unwrap();
-        let birth = events.iter().find(|e| e.kind == EventKind::ProcessBirth).unwrap();
+        let death = events
+            .iter()
+            .find(|e| e.kind == EventKind::ProcessDeath)
+            .unwrap();
+        let birth = events
+            .iter()
+            .find(|e| e.kind == EventKind::ProcessBirth)
+            .unwrap();
         assert_eq!(death.pid, Some(200));
         assert_eq!(birth.pid, Some(300));
     }

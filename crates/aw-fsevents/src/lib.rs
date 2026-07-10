@@ -25,11 +25,16 @@ mod imp {
         kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
         kFSEventStreamEventIdSinceNow,
     };
-    use fsevent_stream::stream::{create_event_stream, Event};
     use fsevent_stream::flags::StreamFlags;
+    use fsevent_stream::stream::{create_event_stream, Event};
     use futures_util::StreamExt;
 
-    pub(super) async fn run(roots: Vec<PathBuf>, latency: Duration, clock: Arc<MonotonicClock>, bus: Bus) {
+    pub(super) async fn run(
+        roots: Vec<PathBuf>,
+        latency: Duration,
+        clock: Arc<MonotonicClock>,
+        bus: Bus,
+    ) {
         // `create_event_stream` performs FFI setup on the calling thread; it is
         // synchronous and cheap. We then drive its async `Stream`.
         let (stream, mut handler) = match create_event_stream(
@@ -110,7 +115,12 @@ mod imp {
     use super::*;
     use std::time::Duration;
 
-    pub(super) async fn run(_roots: Vec<PathBuf>, _latency: Duration, _clock: Arc<MonotonicClock>, _bus: Bus) {
+    pub(super) async fn run(
+        _roots: Vec<PathBuf>,
+        _latency: Duration,
+        _clock: Arc<MonotonicClock>,
+        _bus: Bus,
+    ) {
         tracing::warn!("aw-fsevents is a no-op on non-macOS platforms");
         std::future::pending::<()>().await;
     }
@@ -145,7 +155,9 @@ pub struct FsEventsAdapter {
 
 impl FsEventsAdapter {
     pub fn new() -> Self {
-        Self { config: FsEventsConfig::default() }
+        Self {
+            config: FsEventsConfig::default(),
+        }
     }
 
     pub fn with_config(config: FsEventsConfig) -> Self {
@@ -154,13 +166,19 @@ impl FsEventsAdapter {
 }
 
 impl Default for FsEventsAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for FsEventsAdapter {
-    fn source(&self) -> Source { Source::FileSystem }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Stream }
+    fn source(&self) -> Source {
+        Source::FileSystem
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Stream
+    }
 
     async fn run_stream(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         imp::run(self.config.roots.clone(), self.config.latency, clock, bus).await;
@@ -204,7 +222,9 @@ mod tests {
 
         let handle = tokio::spawn({
             let clock = clock.clone();
-            async move { adapter.run_stream(clock, bus).await; }
+            async move {
+                adapter.run_stream(clock, bus).await;
+            }
         });
 
         // Give FSEvents a moment to set up before we touch the file.
@@ -220,7 +240,11 @@ mod tests {
                 Ok(Some(o)) => o,
                 _ => continue,
             };
-            let path = obs.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = obs
+                .payload
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if path.ends_with("hello.txt") {
                 saw_target = true;
                 break;

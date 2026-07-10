@@ -22,17 +22,25 @@ use aw_core::{Bus, MonotonicClock, Observation, Source, SourceAdapter, SourceBeh
 pub struct NetworkAdapter;
 
 impl NetworkAdapter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for NetworkAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for NetworkAdapter {
-    fn source(&self) -> Source { Source::Network }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Snapshot }
+    fn source(&self) -> Source {
+        Source::Network
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Snapshot
+    }
 
     async fn poll_snapshot(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         for proto in ["tcp", "udp"] {
@@ -89,11 +97,15 @@ pub(crate) fn parse_netstat(output: &str) -> Vec<NetstatRow<'_>> {
     let mut lines = output.lines();
     // Skip lines until past the header row.
     for line in lines.by_ref() {
-        if line.starts_with("Proto") { break; }
+        if line.starts_with("Proto") {
+            break;
+        }
     }
     let mut rows = Vec::new();
     for line in lines {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         if let Some(row) = parse_row(line) {
             rows.push(row);
         }
@@ -105,9 +117,13 @@ const TRAILING_COLS: usize = 8; // state options gencnt flags flags1 usecnt rtnc
 
 fn parse_row(line: &str) -> Option<NetstatRow<'_>> {
     let toks: Vec<&str> = line.split_whitespace().collect();
-    if toks.len() < TRAILING_COLS + 6 { return None; }
+    if toks.len() < TRAILING_COLS + 6 {
+        return None;
+    }
     let proto = toks[0];
-    if !(proto.starts_with("tcp") || proto.starts_with("udp")) { return None; }
+    if !(proto.starts_with("tcp") || proto.starts_with("udp")) {
+        return None;
+    }
 
     // Locate the `name…:pid` token. It is the rightmost token whose tail is
     // `:<digits>` and whose index is to the left of the 8 trailing columns.
@@ -144,7 +160,9 @@ fn parse_row(line: &str) -> Option<NetstatRow<'_>> {
     // shiwat, rhiwat, txbytes, rxbytes (reading right-to-left). Anything
     // further left up to index 3 (post-proto/recv/send/local/foreign) is the
     // optional `(state)` column.
-    if k < 4 { return None; }
+    if k < 4 {
+        return None;
+    }
     let shiwat_idx = k - 1;
     let rhiwat_idx = k - 2;
     let txbytes_idx = k - 3;
@@ -256,7 +274,10 @@ udp4       0      0  *.*                    *.*                                 
     #[test]
     fn parses_tcp_with_state_and_pid() {
         let rows = parse_netstat(SAMPLE);
-        let claude = rows.iter().find(|r| r.pid == Some(23680)).expect("claude row");
+        let claude = rows
+            .iter()
+            .find(|r| r.pid == Some(23680))
+            .expect("claude row");
         assert_eq!(claude.proto, "tcp4");
         assert_eq!(claude.local_addr, "10.0.0.218.53005");
         assert_eq!(claude.foreign_addr, "160.79.104.10.443");
@@ -269,7 +290,10 @@ udp4       0      0  *.*                    *.*                                 
     #[test]
     fn handles_process_name_with_spaces() {
         let rows = parse_netstat(SAMPLE);
-        let vscode = rows.iter().find(|r| r.pid == Some(661)).expect("vscode row");
+        let vscode = rows
+            .iter()
+            .find(|r| r.pid == Some(661))
+            .expect("vscode row");
         assert_eq!(vscode.process_name, "Code - Insiders");
         assert_eq!(vscode.proto, "tcp4");
     }
@@ -277,7 +301,10 @@ udp4       0      0  *.*                    *.*                                 
     #[test]
     fn udp_has_no_state_but_keeps_pid() {
         let rows = parse_netstat(SAMPLE);
-        let helper = rows.iter().find(|r| r.pid == Some(94258)).expect("helper row");
+        let helper = rows
+            .iter()
+            .find(|r| r.pid == Some(94258))
+            .expect("helper row");
         assert_eq!(helper.proto, "udp4");
         assert_eq!(helper.state, None);
         assert_eq!(helper.process_name, "Claude Helper");
@@ -287,7 +314,10 @@ udp4       0      0  *.*                    *.*                                 
     #[test]
     fn unbound_udp_keeps_wildcards() {
         let rows = parse_netstat(SAMPLE);
-        let sym = rows.iter().find(|r| r.pid == Some(470)).expect("symptomsd row");
+        let sym = rows
+            .iter()
+            .find(|r| r.pid == Some(470))
+            .expect("symptomsd row");
         assert_eq!(sym.local_addr, "*.*");
         assert_eq!(sym.foreign_addr, "*.*");
         assert_eq!(sym.process_name, "symptomsd");
@@ -297,7 +327,10 @@ udp4       0      0  *.*                    *.*                                 
     fn extract_process_basic() {
         assert_eq!(extract_process("claude:23680  00102").0, "claude");
         assert_eq!(extract_process("claude:23680  00102").1, Some(23680));
-        assert_eq!(extract_process("Code - Insiders:661 00102").0, "Code - Insiders");
+        assert_eq!(
+            extract_process("Code - Insiders:661 00102").0,
+            "Code - Insiders"
+        );
         assert_eq!(extract_process("Code - Insiders:661 00102").1, Some(661));
     }
 

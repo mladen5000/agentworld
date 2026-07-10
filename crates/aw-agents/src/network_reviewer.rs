@@ -10,9 +10,9 @@
 //! Output is structured JSON: a list of findings keyed by host+process.
 
 use anyhow::Result;
-use aw_events::{Event, EventKind};
 #[cfg(test)]
 use aw_events::SCHEMA_VERSION;
+use aw_events::{Event, EventKind};
 use aw_llm::{Format, GenerateRequest, Options};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,9 @@ pub struct NetworkReviewer {
 }
 
 impl NetworkReviewer {
-    pub fn new(ctx: AgentCtx) -> Self { Self { ctx } }
+    pub fn new(ctx: AgentCtx) -> Self {
+        Self { ctx }
+    }
 
     pub async fn run(&self, events: &[Event]) -> Result<Report> {
         let aggregates = aggregate(events);
@@ -100,7 +102,9 @@ impl NetworkReviewer {
         let (summary, findings) = match serde_json::from_str::<LlmResponse>(raw) {
             Ok(parsed) => (parsed.summary, parsed.findings),
             Err(e) => {
-                tracing::warn!("network_reviewer: JSON parse failed ({e}); falling back to raw text");
+                tracing::warn!(
+                    "network_reviewer: JSON parse failed ({e}); falling back to raw text"
+                );
                 (raw.to_string(), Vec::new())
             }
         };
@@ -123,23 +127,54 @@ fn aggregate(events: &[Event]) -> Vec<Aggregate> {
     // key because the same host on :22 vs :443 is operationally very
     // different — collapsing them hides the signal the LLM needs to flag.
     let mut map: HashMap<(String, String, String), Aggregate> = HashMap::new();
-    for ev in events.iter().filter(|e| e.kind == EventKind::ConnectionCompleted) {
-        let foreign_addr = ev.payload.get("foreign_addr").and_then(|v| v.as_str()).unwrap_or("?");
+    for ev in events
+        .iter()
+        .filter(|e| e.kind == EventKind::ConnectionCompleted)
+    {
+        let foreign_addr = ev
+            .payload
+            .get("foreign_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let (foreign_host, foreign_port) = split_host_port(foreign_addr);
-        let proc_name = ev.payload.get("process_name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-        let bytes_rx = ev.payload.get("bytes_rx").and_then(|v| v.as_u64()).unwrap_or(0);
-        let bytes_tx = ev.payload.get("bytes_tx").and_then(|v| v.as_u64()).unwrap_or(0);
-        let duration_ms = ev.payload.get("duration_ns").and_then(|v| v.as_u64()).unwrap_or(0) / 1_000_000;
+        let proc_name = ev
+            .payload
+            .get("process_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let bytes_rx = ev
+            .payload
+            .get("bytes_rx")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let bytes_tx = ev
+            .payload
+            .get("bytes_tx")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let duration_ms = ev
+            .payload
+            .get("duration_ns")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            / 1_000_000;
 
-        let entry = map.entry((foreign_host.clone(), foreign_port.clone(), proc_name.clone())).or_insert(Aggregate {
-            foreign_host,
-            foreign_port,
-            process_name: proc_name,
-            connections: 0,
-            bytes_rx: 0,
-            bytes_tx: 0,
-            total_duration_ms: 0,
-        });
+        let entry = map
+            .entry((
+                foreign_host.clone(),
+                foreign_port.clone(),
+                proc_name.clone(),
+            ))
+            .or_insert(Aggregate {
+                foreign_host,
+                foreign_port,
+                process_name: proc_name,
+                connections: 0,
+                bytes_rx: 0,
+                bytes_tx: 0,
+                total_duration_ms: 0,
+            });
         entry.connections += 1;
         entry.bytes_rx += bytes_rx;
         entry.bytes_tx += bytes_tx;
@@ -164,10 +199,21 @@ fn split_host_port(addr: &str) -> (String, String) {
 }
 
 fn render_table(rows: &[Aggregate]) -> String {
-    rows.iter().map(|r| format!(
-        "host={} port={} process={} conns={} bytes_rx={} bytes_tx={} duration_ms={}",
-        r.foreign_host, r.foreign_port, r.process_name, r.connections, r.bytes_rx, r.bytes_tx, r.total_duration_ms,
-    )).collect::<Vec<_>>().join("\n")
+    rows.iter()
+        .map(|r| {
+            format!(
+                "host={} port={} process={} conns={} bytes_rx={} bytes_tx={} duration_ms={}",
+                r.foreign_host,
+                r.foreign_port,
+                r.process_name,
+                r.connections,
+                r.bytes_rx,
+                r.bytes_tx,
+                r.total_duration_ms,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -184,7 +230,10 @@ mod tests {
     fn completed(foreign: &str, process: &str, rx: u64, tx: u64, dur_ms: u64) -> Event {
         Event {
             schema_version: SCHEMA_VERSION,
-            timestamp: Timestamp { mono_ns: 0, wall_anchor_ns: 0 },
+            timestamp: Timestamp {
+                mono_ns: 0,
+                wall_anchor_ns: 0,
+            },
             kind: EventKind::ConnectionCompleted,
             pid: Some(1),
             payload: json!({
@@ -206,7 +255,10 @@ mod tests {
         ];
         let aggs = aggregate(&evs);
         // 1.2.3.4:443 collapses into one row; 9.9.9.9:80 is its own row.
-        let s = aggs.iter().find(|a| a.foreign_host == "1.2.3.4" && a.foreign_port == "443").unwrap();
+        let s = aggs
+            .iter()
+            .find(|a| a.foreign_host == "1.2.3.4" && a.foreign_port == "443")
+            .unwrap();
         assert_eq!(s.connections, 2);
         assert_eq!(s.bytes_rx, 300);
         assert_eq!(s.bytes_tx, 100);
@@ -221,10 +273,14 @@ mod tests {
         // A shell talking to :22 is operationally very different from :443.
         let evs = vec![
             completed("1.2.3.4.443", "curl", 100, 50, 10),
-            completed("1.2.3.4.22",  "curl", 7,   3,  1),
+            completed("1.2.3.4.22", "curl", 7, 3, 1),
         ];
         let aggs = aggregate(&evs);
-        assert_eq!(aggs.len(), 2, "different ports must stay separate; got {aggs:?}");
+        assert_eq!(
+            aggs.len(),
+            2,
+            "different ports must stay separate; got {aggs:?}"
+        );
         assert!(aggs.iter().any(|a| a.foreign_port == "443"));
         assert!(aggs.iter().any(|a| a.foreign_port == "22"));
     }
@@ -233,7 +289,10 @@ mod tests {
     fn rendered_table_includes_port() {
         let aggs = aggregate(&[completed("1.2.3.4.22", "ssh", 10, 10, 1)]);
         let table = render_table(&aggs);
-        assert!(table.contains("port=22"), "rendered table must surface port; got: {table}");
+        assert!(
+            table.contains("port=22"),
+            "rendered table must surface port; got: {table}"
+        );
     }
 
     #[tokio::test]
@@ -244,7 +303,13 @@ mod tests {
         let evs = vec![completed("1.2.3.4.443", "curl", 100, 50, 10)];
         let report = agent.run(&evs).await.unwrap();
         assert_eq!(report.summary, "all clear");
-        assert_eq!(report.details.get("conversations_unique").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            report
+                .details
+                .get("conversations_unique")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -253,12 +318,21 @@ mod tests {
         let agent = NetworkReviewer::new(AgentCtx::new(mock.clone(), AgentConfig::default()));
         let evs = vec![Event {
             schema_version: SCHEMA_VERSION,
-            timestamp: Timestamp { mono_ns: 0, wall_anchor_ns: 0 },
+            timestamp: Timestamp {
+                mono_ns: 0,
+                wall_anchor_ns: 0,
+            },
             kind: EventKind::DnsQuery, // not Completed
             pid: None,
             payload: json!({}),
         }];
         let report = agent.run(&evs).await.unwrap();
-        assert_eq!(report.details.get("conversations_unique").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            report
+                .details
+                .get("conversations_unique")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
     }
 }

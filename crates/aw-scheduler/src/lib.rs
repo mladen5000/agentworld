@@ -22,7 +22,12 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(clock: Arc<MonotonicClock>, bus: Bus, poll_interval: Duration) -> Self {
-        Self { clock, bus, poll_interval, handles: Vec::new() }
+        Self {
+            clock,
+            bus,
+            poll_interval,
+            handles: Vec::new(),
+        }
     }
 
     /// Register and start an adapter. The scheduler dispatches by the adapter's

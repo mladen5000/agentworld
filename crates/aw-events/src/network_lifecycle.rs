@@ -89,7 +89,11 @@ impl NetworkLifecycle {
             }
         }
 
-        let key = ConnectionKey { proto, local_addr, foreign_addr };
+        let key = ConnectionKey {
+            proto,
+            local_addr,
+            foreign_addr,
+        };
         // Preserve the original first_seen if we've seen this tuple before
         // either in the current tick (rare — duplicate inside one snapshot)
         // or in the immediately prior tick (the common case).
@@ -102,7 +106,10 @@ impl NetworkLifecycle {
         let record = ConnectionRecord {
             state: p.get("state").and_then(|v| v.as_str()).map(String::from),
             pid: obs.pid,
-            process_name: p.get("process_name").and_then(|v| v.as_str()).map(String::from),
+            process_name: p
+                .get("process_name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             rxbytes: p.get("rxbytes").and_then(|v| v.as_u64()),
             txbytes: p.get("txbytes").and_then(|v| v.as_u64()),
             first_seen,
@@ -144,7 +151,9 @@ impl NetworkLifecycle {
 }
 
 impl Default for NetworkLifecycle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn opened_event(key: &ConnectionKey, rec: &ConnectionRecord) -> Event {
@@ -195,10 +204,7 @@ fn closed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) -> 
 /// bounded above by the snapshot poll interval (the connection may have
 /// actually closed up to one tick before we noticed).
 fn completed_event(key: &ConnectionKey, rec: &ConnectionRecord, now: Timestamp) -> Event {
-    let duration_ns = rec
-        .last_seen
-        .mono_ns
-        .saturating_sub(rec.first_seen.mono_ns);
+    let duration_ns = rec.last_seen.mono_ns.saturating_sub(rec.first_seen.mono_ns);
     Event {
         schema_version: SCHEMA_VERSION,
         timestamp: now,
@@ -225,9 +231,21 @@ mod tests {
     use aw_core::{Source, Timestamp};
     use serde_json::json;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
-    fn netobs(proto: &str, local: &str, foreign: &str, state: Option<&str>, pid: u32, mono: u64) -> Observation {
+    fn netobs(
+        proto: &str,
+        local: &str,
+        foreign: &str,
+        state: Option<&str>,
+        pid: u32,
+        mono: u64,
+    ) -> Observation {
         Observation {
             timestamp: ts(mono),
             source: Source::Network,
@@ -248,7 +266,14 @@ mod tests {
     #[test]
     fn first_tick_emits_nothing() {
         let mut s = NetworkLifecycle::new();
-        s.on_observation(&netobs("tcp4", "10.0.0.1.50", "1.2.3.4.443", Some("ESTABLISHED"), 100, 1));
+        s.on_observation(&netobs(
+            "tcp4",
+            "10.0.0.1.50",
+            "1.2.3.4.443",
+            Some("ESTABLISHED"),
+            100,
+            1,
+        ));
         let events = s.on_tick_complete(ts(2));
         assert!(events.is_empty());
     }
@@ -256,16 +281,43 @@ mod tests {
     #[test]
     fn new_connection_emits_opened() {
         let mut s = NetworkLifecycle::new();
-        s.on_observation(&netobs("tcp4", "10.0.0.1.50", "1.2.3.4.443", Some("ESTABLISHED"), 100, 1));
+        s.on_observation(&netobs(
+            "tcp4",
+            "10.0.0.1.50",
+            "1.2.3.4.443",
+            Some("ESTABLISHED"),
+            100,
+            1,
+        ));
         s.on_tick_complete(ts(2));
         // New connection in tick 2.
-        s.on_observation(&netobs("tcp4", "10.0.0.1.50", "1.2.3.4.443", Some("ESTABLISHED"), 100, 3));
-        s.on_observation(&netobs("tcp4", "10.0.0.1.55", "9.9.9.9.80", Some("ESTABLISHED"), 200, 4));
+        s.on_observation(&netobs(
+            "tcp4",
+            "10.0.0.1.50",
+            "1.2.3.4.443",
+            Some("ESTABLISHED"),
+            100,
+            3,
+        ));
+        s.on_observation(&netobs(
+            "tcp4",
+            "10.0.0.1.55",
+            "9.9.9.9.80",
+            Some("ESTABLISHED"),
+            200,
+            4,
+        ));
         let events = s.on_tick_complete(ts(5));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::ConnectionOpened);
         assert_eq!(events[0].pid, Some(200));
-        assert_eq!(events[0].payload.get("foreign_addr").and_then(|v| v.as_str()), Some("9.9.9.9.80"));
+        assert_eq!(
+            events[0]
+                .payload
+                .get("foreign_addr")
+                .and_then(|v| v.as_str()),
+            Some("9.9.9.9.80")
+        );
     }
 
     #[test]
@@ -278,9 +330,15 @@ mod tests {
         // One Closed and one Completed, in that order.
         assert_eq!(events.len(), 2, "got {events:?}");
         let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, vec![EventKind::ConnectionClosed, EventKind::ConnectionCompleted]);
+        assert_eq!(
+            kinds,
+            vec![EventKind::ConnectionClosed, EventKind::ConnectionCompleted]
+        );
         for e in &events {
-            assert_eq!(e.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
+            assert_eq!(
+                e.payload.get("local_addr").and_then(|v| v.as_str()),
+                Some("a.1")
+            );
             assert_eq!(e.timestamp, ts(3));
         }
     }
@@ -292,7 +350,10 @@ mod tests {
         s.on_tick_complete(ts(2));
         s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, 3));
         let events = s.on_tick_complete(ts(4));
-        assert!(events.is_empty(), "state change without identity change should not emit; got {events:?}");
+        assert!(
+            events.is_empty(),
+            "state change without identity change should not emit; got {events:?}"
+        );
     }
 
     #[test]
@@ -304,27 +365,72 @@ mod tests {
         s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, 1));
 
         // Tick 2: a.1/b.2 again. Finalize tick 1 (primes); diff vs nothing → no events.
-        let events = s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, one_sec + 1));
-        assert!(events.is_empty(), "priming tick should not emit; got {events:?}");
+        let events = s.on_observation(&netobs(
+            "tcp4",
+            "a.1",
+            "b.2",
+            Some("ESTABLISHED"),
+            100,
+            one_sec + 1,
+        ));
+        assert!(
+            events.is_empty(),
+            "priming tick should not emit; got {events:?}"
+        );
 
         // Tick 3: a.2/c.3 only. Finalize tick 2 vs tick 1: both had only a.1/b.2 → no events.
-        let events = s.on_observation(&netobs("tcp4", "a.2", "c.3", Some("ESTABLISHED"), 200, 2 * one_sec + 1));
-        assert!(events.is_empty(), "tick 2 == tick 1 contents; got {events:?}");
+        let events = s.on_observation(&netobs(
+            "tcp4",
+            "a.2",
+            "c.3",
+            Some("ESTABLISHED"),
+            200,
+            2 * one_sec + 1,
+        ));
+        assert!(
+            events.is_empty(),
+            "tick 2 == tick 1 contents; got {events:?}"
+        );
 
         // Tick 4: a.1/b.2 again. Finalize tick 3 vs tick 2: tick 3 had {a.2/c.3}, tick 2 had {a.1/b.2}.
         // Diff: a.2/c.3 opened, a.1/b.2 closed AND completed.
-        let events = s.on_observation(&netobs("tcp4", "a.1", "b.2", Some("ESTABLISHED"), 100, 3 * one_sec + 1));
+        let events = s.on_observation(&netobs(
+            "tcp4",
+            "a.1",
+            "b.2",
+            Some("ESTABLISHED"),
+            100,
+            3 * one_sec + 1,
+        ));
         let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
         assert_eq!(kinds.len(), 3, "got {kinds:?}");
         assert!(kinds.contains(&EventKind::ConnectionOpened));
         assert!(kinds.contains(&EventKind::ConnectionClosed));
         assert!(kinds.contains(&EventKind::ConnectionCompleted));
-        let opened = events.iter().find(|e| e.kind == EventKind::ConnectionOpened).unwrap();
-        let closed = events.iter().find(|e| e.kind == EventKind::ConnectionClosed).unwrap();
-        let completed = events.iter().find(|e| e.kind == EventKind::ConnectionCompleted).unwrap();
-        assert_eq!(opened.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.2"));
-        assert_eq!(closed.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
-        assert_eq!(completed.payload.get("local_addr").and_then(|v| v.as_str()), Some("a.1"));
+        let opened = events
+            .iter()
+            .find(|e| e.kind == EventKind::ConnectionOpened)
+            .unwrap();
+        let closed = events
+            .iter()
+            .find(|e| e.kind == EventKind::ConnectionClosed)
+            .unwrap();
+        let completed = events
+            .iter()
+            .find(|e| e.kind == EventKind::ConnectionCompleted)
+            .unwrap();
+        assert_eq!(
+            opened.payload.get("local_addr").and_then(|v| v.as_str()),
+            Some("a.2")
+        );
+        assert_eq!(
+            closed.payload.get("local_addr").and_then(|v| v.as_str()),
+            Some("a.1")
+        );
+        assert_eq!(
+            completed.payload.get("local_addr").and_then(|v| v.as_str()),
+            Some("a.1")
+        );
     }
 
     #[test]
@@ -386,11 +492,15 @@ mod tests {
         assert_eq!(p.get("bytes_tx").and_then(|v| v.as_u64()), Some(200));
         // opened_at / closed_at preserved.
         assert_eq!(
-            p.get("opened_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            p.get("opened_at")
+                .and_then(|v| v.get("mono_ns"))
+                .and_then(|v| v.as_u64()),
             Some(1000),
         );
         assert_eq!(
-            p.get("closed_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            p.get("closed_at")
+                .and_then(|v| v.get("mono_ns"))
+                .and_then(|v| v.as_u64()),
             Some(3000),
         );
     }
@@ -415,18 +525,29 @@ mod tests {
             .unwrap_or_else(|| panic!("expected Completed; got {events:?}"));
         // Four rotations should not have lost first_seen.
         assert_eq!(
-            completed.payload.get("opened_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            completed
+                .payload
+                .get("opened_at")
+                .and_then(|v| v.get("mono_ns"))
+                .and_then(|v| v.as_u64()),
             Some(100),
             "first_seen survives rotation; payload={:?}",
             completed.payload,
         );
         // last_seen should be the most recent obs (3100), not the close time (5000).
         assert_eq!(
-            completed.payload.get("closed_at").and_then(|v| v.get("mono_ns")).and_then(|v| v.as_u64()),
+            completed
+                .payload
+                .get("closed_at")
+                .and_then(|v| v.get("mono_ns"))
+                .and_then(|v| v.as_u64()),
             Some(3100),
         );
         assert_eq!(
-            completed.payload.get("duration_ns").and_then(|v| v.as_u64()),
+            completed
+                .payload
+                .get("duration_ns")
+                .and_then(|v| v.as_u64()),
             Some(3000),
         );
     }

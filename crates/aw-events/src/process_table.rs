@@ -61,7 +61,10 @@ impl ProcessTable {
     }
 
     pub fn insert(&mut self, entry: ProcessEntry) {
-        let key = ProcKey { pid: entry.pid, start_unix_secs: entry.start_unix_secs };
+        let key = ProcKey {
+            pid: entry.pid,
+            start_unix_secs: entry.start_unix_secs,
+        };
         // Decide latest_by_pid: pick whichever has the larger start_unix_secs.
         // (Ties broken by insertion seq — we just updated `next_seq` below.)
         let should_replace_latest = match self.latest_by_pid.get(&key.pid) {
@@ -88,7 +91,9 @@ impl ProcessTable {
     /// Look up a process by raw pid. Returns the most-recently-born entry
     /// for that pid (right answer under reuse).
     pub fn by_pid(&self, pid: u32) -> Option<&ProcessEntry> {
-        self.latest_by_pid.get(&pid).and_then(|k| self.by_key.get(k))
+        self.latest_by_pid
+            .get(&pid)
+            .and_then(|k| self.by_key.get(k))
     }
 
     pub fn by_key(&self, key: &ProcKey) -> Option<&ProcessEntry> {
@@ -106,8 +111,12 @@ impl ProcessTable {
             _ => return out,
         };
         for _ in 0..MAX_ANCESTORS {
-            if !seen.insert(cur_pid) { break; } // cycle guard
-            let Some(parent) = self.by_pid(cur_pid) else { break; };
+            if !seen.insert(cur_pid) {
+                break;
+            } // cycle guard
+            let Some(parent) = self.by_pid(cur_pid) else {
+                break;
+            };
             out.push(AncestorEntry {
                 pid: parent.pid,
                 comm: parent.comm.clone(),
@@ -123,12 +132,16 @@ impl ProcessTable {
     }
 
     fn evict_if_needed(&mut self) {
-        if self.by_key.len() <= CAP { return; }
+        if self.by_key.len() <= CAP {
+            return;
+        }
         // Find the oldest entry by seq among the *not currently latest_by_pid*
         // set — we don't want to evict the entry a future raw-pid lookup needs.
         let latest_set: std::collections::HashSet<ProcKey> =
             self.latest_by_pid.values().cloned().collect();
-        let victim = self.by_key.iter()
+        let victim = self
+            .by_key
+            .iter()
             .filter(|(k, _)| !latest_set.contains(k))
             .min_by_key(|(_, e)| e.seq)
             .map(|(k, _)| k.clone());
@@ -139,7 +152,9 @@ impl ProcessTable {
 }
 
 impl Default for ProcessTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -190,7 +205,10 @@ mod tests {
     fn mark_dead_keeps_entry_queryable() {
         let mut t = ProcessTable::new();
         t.insert(entry(100, Some(1), "shell", 1000));
-        t.mark_dead(&ProcKey { pid: 100, start_unix_secs: 1000 });
+        t.mark_dead(&ProcKey {
+            pid: 100,
+            start_unix_secs: 1000,
+        });
         let got = t.by_pid(100).unwrap();
         assert!(!got.alive);
         assert_eq!(got.comm.as_deref(), Some("shell"));
@@ -205,9 +223,7 @@ mod tests {
         t.insert(entry(200, Some(100), "subshell", 102));
         t.insert(entry(300, Some(200), "leaf", 103));
         let chain = t.ancestors(300);
-        let comms: Vec<&str> = chain.iter()
-            .filter_map(|a| a.comm.as_deref())
-            .collect();
+        let comms: Vec<&str> = chain.iter().filter_map(|a| a.comm.as_deref()).collect();
         // From 300 we walk ppid 200 -> 100 -> 1 (stops at 1).
         assert_eq!(comms, vec!["subshell", "shell"]);
     }

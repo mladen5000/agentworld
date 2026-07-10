@@ -19,7 +19,9 @@ use crate::{Event, EventKind, SCHEMA_VERSION};
 pub struct WindowLifecycle;
 
 impl WindowLifecycle {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Convert a window observation into zero or one `AppFocus` event.
     pub fn on_observation(&self, obs: &Observation) -> Vec<Event> {
@@ -28,10 +30,18 @@ impl WindowLifecycle {
             Some(v) if !v.is_null() => v,
             _ => return Vec::new(),
         };
-        let from = p.get("from").and_then(|v| if v.is_null() { None } else { Some(v) });
+        let from = p
+            .get("from")
+            .and_then(|v| if v.is_null() { None } else { Some(v) });
 
-        let to_bundle = to.get("bundle_id").and_then(|v| v.as_str()).map(String::from);
-        let from_bundle = from.and_then(|f| f.get("bundle_id")).and_then(|v| v.as_str()).map(String::from);
+        let to_bundle = to
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let from_bundle = from
+            .and_then(|f| f.get("bundle_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Belt-and-brace: drop no-op transitions.
         if from_bundle.is_some() && from_bundle == to_bundle {
@@ -39,12 +49,21 @@ impl WindowLifecycle {
         }
 
         let to_name = to.get("name").and_then(|v| v.as_str()).map(String::from);
-        let to_exec = to.get("exec_path").and_then(|v| v.as_str()).map(String::from);
-        let from_name = from.and_then(|f| f.get("name")).and_then(|v| v.as_str()).map(String::from);
+        let to_exec = to
+            .get("exec_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let from_name = from
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Prefer `to.pid` from the payload; fall back to the observation's
         // top-level pid. (They should agree for a well-formed Layer 1 emit.)
-        let pid = to.get("pid").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+        let pid = to
+            .get("pid")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
             .or(obs.pid);
 
         vec![Event {
@@ -64,7 +83,9 @@ impl WindowLifecycle {
 }
 
 impl Default for WindowLifecycle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -73,7 +94,12 @@ mod tests {
     use aw_core::{Source, Timestamp};
     use serde_json::json;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
     fn obs(from_bundle: Option<&str>, to_bundle: &str, to_name: &str, pid: u32) -> Observation {
         let from = match from_bundle {
@@ -101,9 +127,18 @@ mod tests {
         let ev = &events[0];
         assert_eq!(ev.kind, EventKind::AppFocus);
         assert_eq!(ev.pid, Some(42));
-        assert_eq!(ev.payload.get("from_bundle_id").and_then(|v| v.as_str()), Some("com.app.a"));
-        assert_eq!(ev.payload.get("to_bundle_id").and_then(|v| v.as_str()), Some("com.app.b"));
-        assert_eq!(ev.payload.get("to_name").and_then(|v| v.as_str()), Some("AppB"));
+        assert_eq!(
+            ev.payload.get("from_bundle_id").and_then(|v| v.as_str()),
+            Some("com.app.a")
+        );
+        assert_eq!(
+            ev.payload.get("to_bundle_id").and_then(|v| v.as_str()),
+            Some("com.app.b")
+        );
+        assert_eq!(
+            ev.payload.get("to_name").and_then(|v| v.as_str()),
+            Some("AppB")
+        );
     }
 
     #[test]
@@ -111,7 +146,11 @@ mod tests {
         let stage = WindowLifecycle::new();
         let events = stage.on_observation(&obs(None, "com.app.a", "AppA", 99));
         assert_eq!(events.len(), 1);
-        assert!(events[0].payload.get("from_bundle_id").map(|v| v.is_null()).unwrap_or(false));
+        assert!(events[0]
+            .payload
+            .get("from_bundle_id")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
     }
 
     #[test]

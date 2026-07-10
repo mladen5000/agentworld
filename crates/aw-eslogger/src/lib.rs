@@ -53,18 +53,28 @@ pub struct EsLoggerAdapter {
 }
 
 impl EsLoggerAdapter {
-    pub fn new() -> Self { Self::with_config(EsLoggerConfig::default()) }
-    pub fn with_config(config: EsLoggerConfig) -> Self { Self { config } }
+    pub fn new() -> Self {
+        Self::with_config(EsLoggerConfig::default())
+    }
+    pub fn with_config(config: EsLoggerConfig) -> Self {
+        Self { config }
+    }
 }
 
 impl Default for EsLoggerAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for EsLoggerAdapter {
-    fn source(&self) -> Source { Source::Process }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Stream }
+    fn source(&self) -> Source {
+        Source::Process
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Stream
+    }
 
     async fn run_stream(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         let mut cmd = if self.config.use_sudo {
@@ -77,13 +87,17 @@ impl SourceAdapter for EsLoggerAdapter {
         for evt in &self.config.events {
             cmd.arg(evt);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("aw-eslogger: failed to spawn eslogger ({e}); adapter inert. \
-                    Hint: install eslogger? cache sudo creds? (`sudo -v` then restart aw-observe)");
+                tracing::warn!(
+                    "aw-eslogger: failed to spawn eslogger ({e}); adapter inert. \
+                    Hint: install eslogger? cache sudo creds? (`sudo -v` then restart aw-observe)"
+                );
                 std::future::pending::<()>().await;
                 unreachable!();
             }
@@ -135,7 +149,9 @@ impl SourceAdapter for EsLoggerAdapter {
 }
 
 fn parse_line(line: &str, clock: &MonotonicClock) -> Option<Observation> {
-    if line.trim().is_empty() { return None; }
+    if line.trim().is_empty() {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let pid = extract_pid(&value);
     Some(Observation {
@@ -179,7 +195,11 @@ mod tests {
         let clock = MonotonicClock::new();
         let obs = parse_line(SAMPLE_FORK, &clock).expect("parses");
         // Full payload echoes the input fields.
-        assert!(obs.payload.get("event").and_then(|v| v.get("fork")).is_some());
+        assert!(obs
+            .payload
+            .get("event")
+            .and_then(|v| v.get("fork"))
+            .is_some());
         assert_eq!(obs.pid, Some(1000));
     }
 

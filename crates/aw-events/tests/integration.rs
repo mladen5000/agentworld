@@ -16,11 +16,21 @@ use serde_json::{json, Value};
 // ---------- helpers ---------------------------------------------------------
 
 fn ts(n: u64) -> Timestamp {
-    Timestamp { mono_ns: n, wall_anchor_ns: 0 }
+    Timestamp {
+        mono_ns: n,
+        wall_anchor_ns: 0,
+    }
 }
 
 /// Process snapshot observation matching what `aw-process` emits.
-fn obs_process(pid: u32, ppid: u32, comm: &str, exec: &str, start_unix_secs: u64, mono: u64) -> Observation {
+fn obs_process(
+    pid: u32,
+    ppid: u32,
+    comm: &str,
+    exec: &str,
+    start_unix_secs: u64,
+    mono: u64,
+) -> Observation {
     Observation {
         timestamp: ts(mono),
         source: Source::Process,
@@ -40,7 +50,13 @@ fn obs_process(pid: u32, ppid: u32, comm: &str, exec: &str, start_unix_secs: u64
 }
 
 /// Network (socket) observation matching what `aw-network` emits.
-fn obs_network(pid: u32, local: &str, foreign: &str, state: Option<&str>, mono: u64) -> Observation {
+fn obs_network(
+    pid: u32,
+    local: &str,
+    foreign: &str,
+    state: Option<&str>,
+    mono: u64,
+) -> Observation {
     Observation {
         timestamp: ts(mono),
         source: Source::Network,
@@ -119,12 +135,26 @@ fn process_births_fire_on_tick_boundary() {
     // Tick 2 — launchd + shell (new this tick). Tick 1 finalises here (primes).
     let t2a = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, SEC + 1));
     let t2b = r.process(&obs_process(100, 1, "shell", "/bin/zsh", 200, SEC + 2));
-    assert!(t2a.is_empty() && t2b.is_empty(), "tick 2 must be silent: {:?} {:?}", t2a, t2b);
+    assert!(
+        t2a.is_empty() && t2b.is_empty(),
+        "tick 2 must be silent: {:?} {:?}",
+        t2a,
+        t2b
+    );
 
     // Tick 3 — first obs triggers finalize-of-2. Diff: shell appeared → birth fires.
-    let births = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 2 * SEC + 1));
+    let births = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        100,
+        2 * SEC + 1,
+    ));
     assert!(
-        births.iter().any(|e| e.kind == EventKind::ProcessBirth && e.pid == Some(100)),
+        births
+            .iter()
+            .any(|e| e.kind == EventKind::ProcessBirth && e.pid == Some(100)),
         "expected birth for pid 100 on tick 3 boundary; got {:?}",
         births
     );
@@ -145,13 +175,45 @@ fn connection_event_is_enriched_with_process_table() {
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 1));
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, SEC + 1));
     let _ = r.process(&obs_process(100, 1, "shell", "/bin/zsh", 200, SEC + 2));
-    let _ = r.process(&obs_process(2000, 100, "curl", "/usr/bin/curl", 300, SEC + 3));
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 2 * SEC + 1));
+    let _ = r.process(&obs_process(
+        2000,
+        100,
+        "curl",
+        "/usr/bin/curl",
+        300,
+        SEC + 3,
+    ));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        100,
+        2 * SEC + 1,
+    ));
 
     // Network ticks: prime with a decoy tuple, then the target.
-    let _ = r.process(&obs_network(2000, "10.0.0.1.50000", "9.9.9.9.443", Some("ESTABLISHED"), 3 * SEC + 1));
-    let _ = r.process(&obs_network(2000, "10.0.0.1.50000", "1.2.3.4.443", Some("ESTABLISHED"), 4 * SEC + 1));
-    let events = r.process(&obs_network(2000, "10.0.0.1.50000", "1.2.3.4.443", Some("ESTABLISHED"), 5 * SEC + 1));
+    let _ = r.process(&obs_network(
+        2000,
+        "10.0.0.1.50000",
+        "9.9.9.9.443",
+        Some("ESTABLISHED"),
+        3 * SEC + 1,
+    ));
+    let _ = r.process(&obs_network(
+        2000,
+        "10.0.0.1.50000",
+        "1.2.3.4.443",
+        Some("ESTABLISHED"),
+        4 * SEC + 1,
+    ));
+    let events = r.process(&obs_network(
+        2000,
+        "10.0.0.1.50000",
+        "1.2.3.4.443",
+        Some("ESTABLISHED"),
+        5 * SEC + 1,
+    ));
 
     let opened = events
         .iter()
@@ -178,7 +240,12 @@ fn connection_event_is_enriched_with_process_table() {
         .iter()
         .filter_map(|a| a.get("comm").and_then(|v| v.as_str()))
         .collect();
-    assert_eq!(comms, vec!["shell"], "ancestor chain stops at pid 1; got {:?}", comms);
+    assert_eq!(
+        comms,
+        vec!["shell"],
+        "ancestor chain stops at pid 1; got {:?}",
+        comms
+    );
 }
 
 /// `dns_query` for a known process should carry the same enrichment.
@@ -194,7 +261,14 @@ fn dns_event_is_enriched_with_process_table() {
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, SEC + 1));
     let _ = r.process(&obs_process(2000, 1, "curl", "/usr/bin/curl", 300, SEC + 2));
     // Tick 3 — finalises tick 2, emits birth for pid 2000.
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 2 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        100,
+        2 * SEC + 1,
+    ));
 
     // One DNS observation — emits exactly one DnsQuery event immediately
     // (the dns stage is shape-only, no tick batching).
@@ -205,7 +279,10 @@ fn dns_event_is_enriched_with_process_table() {
         .find(|e| e.kind == EventKind::DnsQuery)
         .expect("dns_query event should fire");
     assert_eq!(dns.pid, Some(2000));
-    assert_eq!(dns.payload.get("masked").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        dns.payload.get("masked").and_then(|v| v.as_bool()),
+        Some(true)
+    );
     assert_eq!(
         proc_field(dns, "comm").and_then(|v| v.as_str()),
         Some("curl"),
@@ -232,10 +309,18 @@ fn fsevents_in_same_window_coalesce_then_flush() {
     // emitted yet).
     let events = r.process(&obs_fs("/tmp/y", &["created"], 5, 600_000_000));
 
-    assert_eq!(events.len(), 1, "expected one flushed file_changed for /tmp/x; got {:?}", events);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected one flushed file_changed for /tmp/x; got {:?}",
+        events
+    );
     let ev = &events[0];
     assert_eq!(ev.kind, EventKind::FileChanged);
-    assert_eq!(ev.payload.get("path").and_then(|v| v.as_str()), Some("/tmp/x"));
+    assert_eq!(
+        ev.payload.get("path").and_then(|v| v.as_str()),
+        Some("/tmp/x")
+    );
     let flags: Vec<&str> = ev
         .payload
         .get("flags")
@@ -245,7 +330,11 @@ fn fsevents_in_same_window_coalesce_then_flush() {
         .filter_map(|v| v.as_str())
         .collect();
     for expected in ["created", "modified", "xattr_mod", "is_file"] {
-        assert!(flags.contains(&expected), "missing {expected} in {:?}", flags);
+        assert!(
+            flags.contains(&expected),
+            "missing {expected} in {:?}",
+            flags
+        );
     }
     assert_eq!(ev.payload.get("count").and_then(|v| v.as_u64()), Some(4));
 }
@@ -259,10 +348,22 @@ fn network_state_change_does_not_emit_close_open() {
     // Tick 1: SYN_SENT.
     r.process(&obs_network(100, "a.1", "b.2", Some("SYN_SENT"), 1));
     // Tick 2: ESTABLISHED. Same tuple — should be considered the same connection.
-    let _ = r.process(&obs_network(100, "a.1", "b.2", Some("ESTABLISHED"), SEC + 1));
+    let _ = r.process(&obs_network(
+        100,
+        "a.1",
+        "b.2",
+        Some("ESTABLISHED"),
+        SEC + 1,
+    ));
     // Tick 3: still ESTABLISHED. The transition between ticks 2 and 3 fires
     // (no diff). The tick boundary between 1 and 2 only primes (no diff to compare).
-    let events = r.process(&obs_network(100, "a.1", "b.2", Some("ESTABLISHED"), 2 * SEC + 1));
+    let events = r.process(&obs_network(
+        100,
+        "a.1",
+        "b.2",
+        Some("ESTABLISHED"),
+        2 * SEC + 1,
+    ));
 
     let kinds = kinds_of(&events);
     assert!(
@@ -284,8 +385,20 @@ fn unknown_pid_does_not_invent_process_context() {
     let mut r = Reconstructor::new();
 
     r.process(&obs_network(99999, "x.1", "y.2", Some("ESTABLISHED"), 1));
-    let events = r.process(&obs_network(99999, "x.1", "y.2", Some("ESTABLISHED"), SEC + 1));
-    let events2 = r.process(&obs_network(99999, "x.1", "y.2", Some("ESTABLISHED"), 2 * SEC + 1));
+    let events = r.process(&obs_network(
+        99999,
+        "x.1",
+        "y.2",
+        Some("ESTABLISHED"),
+        SEC + 1,
+    ));
+    let events2 = r.process(&obs_network(
+        99999,
+        "x.1",
+        "y.2",
+        Some("ESTABLISHED"),
+        2 * SEC + 1,
+    ));
 
     let all: Vec<Event> = events.into_iter().chain(events2).collect();
     // If a connection_opened did fire, it must lack `process`.
@@ -295,10 +408,20 @@ fn unknown_pid_does_not_invent_process_context() {
             .get("process")
             .map(|v| !v.is_null())
             .unwrap_or(false);
-        assert!(!has_process, "must not invent process context: {:?}", ev.payload);
+        assert!(
+            !has_process,
+            "must not invent process context: {:?}",
+            ev.payload
+        );
         // Raw fields must still be there.
-        assert_eq!(ev.payload.get("local_addr").and_then(|v| v.as_str()), Some("x.1"));
-        assert_eq!(ev.payload.get("foreign_addr").and_then(|v| v.as_str()), Some("y.2"));
+        assert_eq!(
+            ev.payload.get("local_addr").and_then(|v| v.as_str()),
+            Some("x.1")
+        );
+        assert_eq!(
+            ev.payload.get("foreign_addr").and_then(|v| v.as_str()),
+            Some("y.2")
+        );
     }
 }
 
@@ -319,26 +442,72 @@ fn pid_reuse_with_new_start_routes_to_correct_entry() {
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 50, SEC + 1));
     let _ = r.process(&obs_process(100, 1, "old", "/bin/old", 1000, SEC + 2));
     // Tick 3: same → triggers birth for old.
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 50, 2 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        50,
+        2 * SEC + 1,
+    ));
     let _ = r.process(&obs_process(100, 1, "old", "/bin/old", 1000, 2 * SEC + 2));
 
     // === Death of old ===
     // Tick 4: pid 100 absent. Triggers finalize-of-3 → death of 100 (start=1000).
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 50, 3 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        50,
+        3 * SEC + 1,
+    ));
 
     // === Birth new (pid 100, start 2000) ===
     // Tick 5: introduces new pid 100/2000. Finalises tick 4 (only launchd → no diff).
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 50, 4 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        50,
+        4 * SEC + 1,
+    ));
     let _ = r.process(&obs_process(100, 1, "new", "/bin/new", 2000, 4 * SEC + 2));
     // Tick 6: triggers finalize-of-5 → birth of (100, 2000).
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 50, 5 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        50,
+        5 * SEC + 1,
+    ));
     let _ = r.process(&obs_process(100, 1, "new", "/bin/new", 2000, 5 * SEC + 2));
 
     // === Network for pid 100 ===
     // Prime with decoy, then target, then trigger.
-    let _ = r.process(&obs_network(100, "n.1", "decoy.2", Some("ESTABLISHED"), 6 * SEC + 1));
-    let _ = r.process(&obs_network(100, "n.1", "n.2", Some("ESTABLISHED"), 7 * SEC + 1));
-    let events = r.process(&obs_network(100, "n.1", "n.2", Some("ESTABLISHED"), 8 * SEC + 1));
+    let _ = r.process(&obs_network(
+        100,
+        "n.1",
+        "decoy.2",
+        Some("ESTABLISHED"),
+        6 * SEC + 1,
+    ));
+    let _ = r.process(&obs_network(
+        100,
+        "n.1",
+        "n.2",
+        Some("ESTABLISHED"),
+        7 * SEC + 1,
+    ));
+    let events = r.process(&obs_network(
+        100,
+        "n.1",
+        "n.2",
+        Some("ESTABLISHED"),
+        8 * SEC + 1,
+    ));
 
     let opened = events
         .iter()
@@ -372,18 +541,36 @@ fn dns_routing_does_not_pollute_netstat_stage() {
     // Interleave a DNS observation in the *same* tick — must not affect the
     // netstat stage's `current` set.
     let dns_events = r.process(&obs_dns(100, "example.com.", "A", false, 2));
-    assert_eq!(dns_events.len(), 1, "DNS obs emits exactly one DnsQuery; got {:?}", dns_events);
+    assert_eq!(
+        dns_events.len(),
+        1,
+        "DNS obs emits exactly one DnsQuery; got {:?}",
+        dns_events
+    );
     assert_eq!(dns_events[0].kind, EventKind::DnsQuery);
 
     // Tick 2: same socket observation. If DNS had polluted the netstat stage,
     // we might see a close/open dance here.
-    let _ = r.process(&obs_network(100, "s.1", "s.2", Some("ESTABLISHED"), SEC + 1));
+    let _ = r.process(&obs_network(
+        100,
+        "s.1",
+        "s.2",
+        Some("ESTABLISHED"),
+        SEC + 1,
+    ));
 
     // Tick 3: triggers diff of tick 2 vs tick 1 → unchanged set, no events.
-    let events = r.process(&obs_network(100, "s.1", "s.2", Some("ESTABLISHED"), 2 * SEC + 1));
+    let events = r.process(&obs_network(
+        100,
+        "s.1",
+        "s.2",
+        Some("ESTABLISHED"),
+        2 * SEC + 1,
+    ));
     let kinds = kinds_of(&events);
     assert!(
-        !kinds.contains(&EventKind::ConnectionOpened) && !kinds.contains(&EventKind::ConnectionClosed),
+        !kinds.contains(&EventKind::ConnectionOpened)
+            && !kinds.contains(&EventKind::ConnectionClosed),
         "DNS interleaving must not perturb netstat diff; got {:?}",
         kinds,
     );
@@ -400,21 +587,52 @@ fn connection_completed_is_emitted_with_duration_and_enrichment() {
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 1));
     let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, SEC + 1));
     let _ = r.process(&obs_process(2000, 1, "curl", "/usr/bin/curl", 300, SEC + 2));
-    let _ = r.process(&obs_process(1, 0, "launchd", "/sbin/launchd", 100, 2 * SEC + 1));
+    let _ = r.process(&obs_process(
+        1,
+        0,
+        "launchd",
+        "/sbin/launchd",
+        100,
+        2 * SEC + 1,
+    ));
 
     // Net tick A (priming): tuple `t.target` first seen at 3 * SEC.
-    let _ = r.process(&obs_network(2000, "10.0.0.1.1", "1.2.3.4.443", Some("ESTABLISHED"), 3 * SEC));
+    let _ = r.process(&obs_network(
+        2000,
+        "10.0.0.1.1",
+        "1.2.3.4.443",
+        Some("ESTABLISHED"),
+        3 * SEC,
+    ));
     // Net tick B: same tuple, still present at 4 * SEC. The diff between
     // tick A and tick B is empty, but `first_seen` is preserved across the
     // rotation so the eventual Completed event has duration > 0.
-    let _ = r.process(&obs_network(2000, "10.0.0.1.1", "1.2.3.4.443", Some("ESTABLISHED"), 4 * SEC));
+    let _ = r.process(&obs_network(
+        2000,
+        "10.0.0.1.1",
+        "1.2.3.4.443",
+        Some("ESTABLISHED"),
+        4 * SEC,
+    ));
     // Net tick C: tuple vanishes; observe a *different* tuple. Finalize-of-B
     // is a no-op (both ticks had the target). After rotation, prior={target},
     // current={other}.
-    let _ = r.process(&obs_network(2000, "10.0.0.1.1", "9.9.9.9.80", Some("ESTABLISHED"), 5 * SEC));
+    let _ = r.process(&obs_network(
+        2000,
+        "10.0.0.1.1",
+        "9.9.9.9.80",
+        Some("ESTABLISHED"),
+        5 * SEC,
+    ));
     // Net tick D: any obs triggers finalize-of-C. Now diff sees target gone
     // from current → closed + completed for target; other is new → opened.
-    let events = r.process(&obs_network(2000, "10.0.0.1.1", "9.9.9.9.80", Some("ESTABLISHED"), 6 * SEC));
+    let events = r.process(&obs_network(
+        2000,
+        "10.0.0.1.1",
+        "9.9.9.9.80",
+        Some("ESTABLISHED"),
+        6 * SEC,
+    ));
 
     let completed = events
         .iter()
@@ -426,7 +644,10 @@ fn connection_completed_is_emitted_with_duration_and_enrichment() {
 
     // Duration is last_seen - first_seen = 4*SEC - 3*SEC = SEC.
     assert_eq!(
-        completed.payload.get("duration_ns").and_then(|v| v.as_u64()),
+        completed
+            .payload
+            .get("duration_ns")
+            .and_then(|v| v.as_u64()),
         Some(SEC),
         "duration; payload={:?}",
         completed.payload,

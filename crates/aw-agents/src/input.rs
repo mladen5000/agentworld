@@ -20,7 +20,9 @@ pub fn read_events(reader: impl Read) -> Result<Vec<Event>> {
     for line in buf.lines() {
         let line = line?;
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         match serde_json::from_str::<Event>(trimmed) {
             Ok(ev) => out.push(ev),
             Err(_) => {

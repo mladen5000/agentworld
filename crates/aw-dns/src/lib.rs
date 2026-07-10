@@ -24,8 +24,8 @@
 //! from socket observations by `payload.kind == "dns_query"`.
 
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use aw_core::{Bus, MonotonicClock, Observation, Source, SourceAdapter, SourceBehavior};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -34,25 +34,35 @@ use tokio::process::Command;
 pub struct DnsAdapter;
 
 impl DnsAdapter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for DnsAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for DnsAdapter {
-    fn source(&self) -> Source { Source::Network }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Stream }
+    fn source(&self) -> Source {
+        Source::Network
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Stream
+    }
 
     async fn run_stream(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         // Build the command. The predicate must be passed as a single argv
         // entry; doing so via .arg() avoids any shell quoting concerns.
         let mut cmd = Command::new("log");
         cmd.arg("stream")
-            .arg("--style").arg("ndjson")
-            .arg("--predicate").arg("subsystem == \"com.apple.mDNSResponder\"")
+            .arg("--style")
+            .arg("ndjson")
+            .arg("--predicate")
+            .arg("subsystem == \"com.apple.mDNSResponder\"")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
@@ -113,7 +123,9 @@ impl SourceAdapter for DnsAdapter {
 }
 
 fn parse_line(line: &str, clock: &MonotonicClock, warned: &AtomicBool) -> Option<Observation> {
-    if line.trim().is_empty() { return None; }
+    if line.trim().is_empty() {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let message = value.get("eventMessage")?.as_str()?;
     // We're only interested in query-start records. mDNSResponder emits many
@@ -189,7 +201,9 @@ fn extract_query(msg: &str) -> Option<Query> {
         .trim_end_matches(')')
         .to_string();
     // "name hash: <hex>" runs to end of line; no trailing comma.
-    let name_hash = msg.rsplit_once("name hash: ").map(|(_, s)| s.trim().to_string())
+    let name_hash = msg
+        .rsplit_once("name hash: ")
+        .map(|(_, s)| s.trim().to_string())
         .unwrap_or_default();
 
     let masked = qname_raw.starts_with("<mask.hash");
@@ -223,9 +237,12 @@ mod tests {
 
     const UNMASKED_START_LINE: &str = r#"{"eventMessage":"[R63932] DNSServiceQueryRecord START -- qname: example.com., qtype: AAAA, flags: 0x0, interface index: 1, client pid: 99 (curl), name hash: deadbeef"}"#;
 
-    const UNRELATED_LINE: &str = r#"{"eventMessage":"[R63931->Q36719] Question assigned DNS service 6"}"#;
+    const UNRELATED_LINE: &str =
+        r#"{"eventMessage":"[R63931->Q36719] Question assigned DNS service 6"}"#;
 
-    fn clock() -> MonotonicClock { MonotonicClock::new() }
+    fn clock() -> MonotonicClock {
+        MonotonicClock::new()
+    }
 
     #[test]
     fn parses_masked_query() {
@@ -238,8 +255,14 @@ mod tests {
         assert_eq!(p.get("kind").and_then(|v| v.as_str()), Some("dns_query"));
         assert_eq!(p.get("qtype").and_then(|v| v.as_str()), Some("A"));
         assert_eq!(p.get("masked").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(p.get("name_hash").and_then(|v| v.as_str()), Some("e325f5d4"));
-        assert_eq!(p.get("client_process_name").and_then(|v| v.as_str()), Some("gk_3_1_63"));
+        assert_eq!(
+            p.get("name_hash").and_then(|v| v.as_str()),
+            Some("e325f5d4")
+        );
+        assert_eq!(
+            p.get("client_process_name").and_then(|v| v.as_str()),
+            Some("gk_3_1_63")
+        );
         assert_eq!(p.get("interface_index").and_then(|v| v.as_i64()), Some(0));
         // Warning was emitted (atomic flipped).
         assert!(warned.load(Ordering::Relaxed));
@@ -251,10 +274,16 @@ mod tests {
         let warned = AtomicBool::new(false);
         let obs = parse_line(UNMASKED_START_LINE, &c, &warned).expect("parses");
         let p = &obs.payload;
-        assert_eq!(p.get("qname").and_then(|v| v.as_str()), Some("example.com."));
+        assert_eq!(
+            p.get("qname").and_then(|v| v.as_str()),
+            Some("example.com.")
+        );
         assert_eq!(p.get("qtype").and_then(|v| v.as_str()), Some("AAAA"));
         assert_eq!(p.get("masked").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(p.get("client_process_name").and_then(|v| v.as_str()), Some("curl"));
+        assert_eq!(
+            p.get("client_process_name").and_then(|v| v.as_str()),
+            Some("curl")
+        );
         // No masking → no warning issued.
         assert!(!warned.load(Ordering::Relaxed));
     }

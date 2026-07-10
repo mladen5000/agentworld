@@ -23,8 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aw_agents::process_anomaly::ProcessAnomalyDetector;
-use aw_agents::timeline_narrator::TimelineNarrator;
+use aw_agents::process_anomaly::{
+    suspicion_flags_from_store, ProcessAnomalyDetector, DEFAULT_PROLIFIC_PARENT_THRESHOLD,
+    DEFAULT_TRUSTED_PATH_PREFIXES,
+};
+use aw_agents::timeline_narrator::{summarize_capture, NoveltySummary, TimelineNarrator};
 use aw_agents::{AgentConfig, AgentCtx};
 use aw_core::{Bus, MonotonicClock, Source};
 use aw_dns::DnsAdapter;
@@ -324,7 +327,9 @@ async fn run_one_shot(args: Args) -> Result<()> {
 
     // Persist the capture (graph + event history) BEFORE any LLM call so an
     // unreachable or slow model can't lose it. `merge_graph` is idempotent:
-    // re-run produces no duplicates, just bumps edge counts.
+    // re-run produces no duplicates, just bumps edge counts. The store stays
+    // open — narration enrichment (novelty, suspicion flags) reads it below.
+    let mut opened_store: Option<(Store, PathBuf)> = None;
     if let Some(path) = resolve_store_path(&args) {
         match open_store(path) {
             Ok((mut store, p)) => {
@@ -345,6 +350,7 @@ async fn run_one_shot(args: Args) -> Result<()> {
                         Err(e) => eprintln!("aw-mvp: event append failed: {e}"),
                     }
                 }
+                opened_store = Some((store, p));
             }
             Err(e) => eprintln!("aw-mvp: could not open store: {e}"),
         }
@@ -368,11 +374,23 @@ async fn run_one_shot(args: Args) -> Result<()> {
 
     // The capture is already durable; from here on LLM failures only cost
     // narration, never data.
+    let mut summary = summarize_capture(&events);
+    if let Some((store, _)) = opened_store.as_ref() {
+        let from_unix_ns = now_unix_ns().saturating_sub(args.duration.as_nanos() as i64);
+        enrich_summary_from_store(&mut summary, store, from_unix_ns);
+    }
+    let flags_fallback = summary.suspicions.clone();
     eprintln!("aw-mvp: asking {} to narrate...", args.model);
-    match TimelineNarrator::new(make_ctx()).run(&events).await {
+    match TimelineNarrator::new(make_ctx()).run_summary(summary).await {
         Ok(narrative) => println!("{}", narrative.summary),
         Err(e) => {
-            eprintln!("aw-mvp: narration failed (is Ollama running and the model pulled?): {e}")
+            eprintln!("aw-mvp: narration failed (is Ollama running and the model pulled?): {e}");
+            if !flags_fallback.is_empty() {
+                println!("[narration unavailable] anomaly flags this capture:");
+                for f in &flags_fallback {
+                    println!("  - {f}");
+                }
+            }
         }
     }
 
@@ -515,6 +533,41 @@ fn acquire_instance_lock(store_path: &std::path::Path) -> Result<InstanceLock> {
         );
     }
     Ok(InstanceLock { _file: file })
+}
+
+/// The store's history must predate the narration window by at least this
+/// long before "never seen before" claims are made — with less history the
+/// baseline is cold and everything would falsely read as new.
+const NOVELTY_MIN_BASELINE_NS: i64 = 30 * 60 * 1_000_000_000;
+
+/// Store-backed enrichment shared by daemon ticks and one-shot runs: mark
+/// what in `[from_unix_ns, now]` was seen for the first time ever, and append
+/// the rule-based lineage/path/fan-out suspicion flags for the same window.
+/// Failures degrade to an unenriched summary with a stderr note — narration
+/// must never be lost to an enrichment query.
+fn enrich_summary_from_store(
+    summary: &mut aw_agents::timeline_narrator::CaptureSummary,
+    store: &Store,
+    from_unix_ns: i64,
+) {
+    match store.novel_since(from_unix_ns) {
+        Ok(report) => {
+            let cold = report.oldest_first_seen_unix_ns.map_or(true, |oldest| {
+                oldest > from_unix_ns - NOVELTY_MIN_BASELINE_NS
+            });
+            summary.novelty = Some(NoveltySummary::from_report(&report, cold));
+        }
+        Err(e) => eprintln!("aw-mvp: novelty query failed: {e}"),
+    }
+    match suspicion_flags_from_store(
+        store,
+        from_unix_ns,
+        DEFAULT_TRUSTED_PATH_PREFIXES,
+        DEFAULT_PROLIFIC_PARENT_THRESHOLD,
+    ) {
+        Ok(flags) => summary.suspicions.extend(flags),
+        Err(e) => eprintln!("aw-mvp: suspicion queries failed: {e}"),
+    }
 }
 
 /// Wall-clock now in unix nanoseconds — the encoding the store uses.
@@ -720,11 +773,23 @@ async fn run_daemon(args: Args) -> Result<()> {
                 // Snapshot the window for the LLM call. Cheap clone — Events
                 // are small, and the window itself is bounded.
                 let snapshot: Vec<Event> = window.iter().cloned().collect();
+                // Aggregate + enrich synchronously (pure Rust + a few indexed
+                // SQLite reads — fast); only the LLM call runs in the task.
+                // The store was merged just above, so it already reflects
+                // everything in this window.
+                let mut summary = summarize_capture(&snapshot);
+                if let Some((store, _, _)) = store_and_builder.as_ref() {
+                    let from_unix_ns = now_unix_ns().saturating_sub(window_ns as i64);
+                    enrich_summary_from_store(&mut summary, store, from_unix_ns);
+                }
+                // The computed flags must survive an LLM outage — a watcher
+                // wouldn't go blind just because the narrator lost its voice.
+                let flags_fallback = summary.suspicions.clone();
+                let n = snapshot.len();
                 let ctx = make_ctx();
                 narrating = Some(tokio::spawn(async move {
                     let started = std::time::Instant::now();
-                    let n = snapshot.len();
-                    match TimelineNarrator::new(ctx).live().run(&snapshot).await {
+                    match TimelineNarrator::new(ctx).live().run_summary(summary).await {
                         Ok(report) => {
                             eprintln!(
                                 "aw-mvp: narrated {n} events in {:.1}s",
@@ -735,7 +800,16 @@ async fn run_daemon(args: Args) -> Result<()> {
                             println!("{}", report.summary);
                             println!();
                         }
-                        Err(e) => eprintln!("aw-mvp: narration failed: {e}"),
+                        Err(e) => {
+                            eprintln!("aw-mvp: narration failed: {e}");
+                            if !flags_fallback.is_empty() {
+                                println!("[narration unavailable] anomaly flags this window:");
+                                for f in &flags_fallback {
+                                    println!("  - {f}");
+                                }
+                                println!();
+                            }
+                        }
                     }
                 }));
             }

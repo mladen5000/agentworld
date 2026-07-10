@@ -62,9 +62,14 @@ impl FsEventsCoalesce {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return Vec::new(),
         };
-        let flags: Vec<String> = p.get("flags")
+        let flags: Vec<String> = p
+            .get("flags")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let event_id = p.get("event_id").and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -100,12 +105,17 @@ impl FsEventsCoalesce {
     /// Flush any remaining buffered windows. Call at end-of-input (e.g. EOF in
     /// the offline binary; shutdown in live mode if you want a clean tail).
     pub fn flush_all(&mut self) -> Vec<Event> {
-        let flush_ts = match self.last_ts { Some(t) => t, None => return Vec::new() };
+        let flush_ts = match self.last_ts {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
         self.drain_buffer(flush_ts)
     }
 
     fn drain_buffer(&mut self, flush_ts: Timestamp) -> Vec<Event> {
-        if self.buffer.is_empty() { return Vec::new(); }
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(self.buffer.len());
         for (path, rec) in self.buffer.drain() {
             out.push(file_changed_event(&path, &rec, flush_ts));
@@ -115,7 +125,9 @@ impl FsEventsCoalesce {
 }
 
 impl Default for FsEventsCoalesce {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn file_changed_event(path: &str, rec: &PathRecord, flush_ts: Timestamp) -> Event {
@@ -141,7 +153,12 @@ mod tests {
     use aw_core::Source;
     use serde_json::json;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
     fn fsobs(path: &str, flags: &[&str], event_id: u64, mono: u64) -> Observation {
         Observation {
@@ -171,10 +188,19 @@ mod tests {
         assert_eq!(events.len(), 1, "got {events:?}");
         let p = &events[0].payload;
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/x"));
-        let flags: Vec<&str> = p.get("flags").unwrap().as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let flags: Vec<&str> = p
+            .get("flags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         for expected in ["created", "modified", "xattr_mod", "is_file"] {
-            assert!(flags.contains(&expected), "missing {expected}; got {flags:?}");
+            assert!(
+                flags.contains(&expected),
+                "missing {expected}; got {flags:?}"
+            );
         }
         assert_eq!(p.get("count").and_then(|v| v.as_u64()), Some(4));
         assert_eq!(p.get("event_ids").unwrap().as_array().unwrap().len(), 4);
@@ -186,7 +212,8 @@ mod tests {
         s.on_observation(&fsobs("/a", &["created"], 1, 1));
         s.on_observation(&fsobs("/b", &["modified"], 2, 2));
         let events = s.flush_all();
-        let paths: Vec<&str> = events.iter()
+        let paths: Vec<&str> = events
+            .iter()
             .map(|e| e.payload.get("path").and_then(|v| v.as_str()).unwrap())
             .collect();
         assert_eq!(events.len(), 2);
@@ -203,16 +230,29 @@ mod tests {
         // Window 1: /b touched. Should flush /a.
         let events = s.on_observation(&fsobs("/b", &["created"], 3, 600_000_000));
         assert_eq!(events.len(), 1, "expected /a flush; got {events:?}");
-        assert_eq!(events[0].payload.get("path").and_then(|v| v.as_str()), Some("/a"));
-        let flags: Vec<&str> = events[0].payload.get("flags").unwrap().as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            events[0].payload.get("path").and_then(|v| v.as_str()),
+            Some("/a")
+        );
+        let flags: Vec<&str> = events[0]
+            .payload
+            .get("flags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(flags.contains(&"created"));
         assert!(flags.contains(&"modified"));
 
         // /b still buffered until next window.
         let tail = s.flush_all();
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].payload.get("path").and_then(|v| v.as_str()), Some("/b"));
+        assert_eq!(
+            tail[0].payload.get("path").and_then(|v| v.as_str()),
+            Some("/b")
+        );
     }
 
     #[test]
@@ -221,10 +261,20 @@ mod tests {
         s.on_observation(&fsobs("/x", &["modified", "is_file"], 1, 1));
         s.on_observation(&fsobs("/x", &["modified"], 2, 100_000_000));
         let events = s.flush_all();
-        let flags: Vec<&str> = events[0].payload.get("flags").unwrap().as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let flags: Vec<&str> = events[0]
+            .payload
+            .get("flags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         let modified_count = flags.iter().filter(|f| **f == "modified").count();
-        assert_eq!(modified_count, 1, "modified should appear once; got {flags:?}");
+        assert_eq!(
+            modified_count, 1,
+            "modified should appear once; got {flags:?}"
+        );
         assert!(flags.contains(&"is_file"));
     }
 

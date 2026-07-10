@@ -15,7 +15,9 @@ use crate::{Event, EventKind, SCHEMA_VERSION};
 pub struct DnsLifecycle;
 
 impl DnsLifecycle {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn on_observation(&self, obs: &Observation) -> Vec<Event> {
         let p = &obs.payload;
@@ -27,10 +29,16 @@ impl DnsLifecycle {
 
         let qname = p.get("qname").and_then(|v| v.as_str()).map(String::from);
         let qtype = p.get("qtype").and_then(|v| v.as_str()).map(String::from);
-        let name_hash = p.get("name_hash").and_then(|v| v.as_str()).map(String::from);
+        let name_hash = p
+            .get("name_hash")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let masked = p.get("masked").and_then(|v| v.as_bool()).unwrap_or(false);
         let interface_index = p.get("interface_index").and_then(|v| v.as_i64());
-        let client_process_name = p.get("client_process_name").and_then(|v| v.as_str()).map(String::from);
+        let client_process_name = p
+            .get("client_process_name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         vec![Event {
             schema_version: SCHEMA_VERSION,
@@ -50,7 +58,9 @@ impl DnsLifecycle {
 }
 
 impl Default for DnsLifecycle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// True iff `obs` is a DNS-query-bearing observation. Used by the
@@ -66,7 +76,12 @@ mod tests {
     use aw_core::{Source, Timestamp};
     use serde_json::json;
 
-    fn ts(n: u64) -> Timestamp { Timestamp { mono_ns: n, wall_anchor_ns: 0 } }
+    fn ts(n: u64) -> Timestamp {
+        Timestamp {
+            mono_ns: n,
+            wall_anchor_ns: 0,
+        }
+    }
 
     fn dns_obs(pid: u32, qtype: &str, qname: &str, masked: bool) -> Observation {
         Observation {
@@ -108,8 +123,14 @@ mod tests {
         assert_eq!(e.kind, EventKind::DnsQuery);
         assert_eq!(e.pid, Some(42));
         assert_eq!(e.payload.get("qtype").and_then(|v| v.as_str()), Some("A"));
-        assert_eq!(e.payload.get("qname").and_then(|v| v.as_str()), Some("example.com."));
-        assert_eq!(e.payload.get("masked").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            e.payload.get("qname").and_then(|v| v.as_str()),
+            Some("example.com.")
+        );
+        assert_eq!(
+            e.payload.get("masked").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -117,8 +138,14 @@ mod tests {
         let s = DnsLifecycle::new();
         let events = s.on_observation(&dns_obs(42, "AAAA", "<mask.hash: 'xxx=='>", true));
         let e = &events[0];
-        assert_eq!(e.payload.get("masked").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(e.payload.get("name_hash").and_then(|v| v.as_str()), Some("abc123"));
+        assert_eq!(
+            e.payload.get("masked").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            e.payload.get("name_hash").and_then(|v| v.as_str()),
+            Some("abc123")
+        );
     }
 
     #[test]

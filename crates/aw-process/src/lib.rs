@@ -19,17 +19,25 @@ use aw_core::{Bus, MonotonicClock, Observation, Source, SourceAdapter, SourceBeh
 pub struct ProcessAdapter;
 
 impl ProcessAdapter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for ProcessAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl SourceAdapter for ProcessAdapter {
-    fn source(&self) -> Source { Source::Process }
-    fn behavior(&self) -> SourceBehavior { SourceBehavior::Snapshot }
+    fn source(&self) -> Source {
+        Source::Process
+    }
+    fn behavior(&self) -> SourceBehavior {
+        SourceBehavior::Snapshot
+    }
 
     async fn poll_snapshot(&self, clock: Arc<MonotonicClock>, bus: Bus) {
         // libproc calls are blocking syscalls. Move off the async runtime.
@@ -37,7 +45,8 @@ impl SourceAdapter for ProcessAdapter {
         let bus_clone = bus.clone();
         let _ = tokio::task::spawn_blocking(move || {
             imp::snapshot(&clock_clone, &bus_clone);
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -58,14 +67,28 @@ mod imp {
         };
         for pid in pids {
             let pid = pid as i32;
-            if pid <= 0 { continue; }
-            let Ok(info): Result<BSDInfo, _> = pidinfo(pid, 0) else { continue; };
+            if pid <= 0 {
+                continue;
+            }
+            let Ok(info): Result<BSDInfo, _> = pidinfo(pid, 0) else {
+                continue;
+            };
             let exec_path = pidpath(pid).ok();
-            bus.emit(to_observation(pid as u32, &info, exec_path.as_deref(), clock));
+            bus.emit(to_observation(
+                pid as u32,
+                &info,
+                exec_path.as_deref(),
+                clock,
+            ));
         }
     }
 
-    fn to_observation(pid: u32, info: &BSDInfo, exec_path: Option<&str>, clock: &MonotonicClock) -> Observation {
+    fn to_observation(
+        pid: u32,
+        info: &BSDInfo,
+        exec_path: Option<&str>,
+        clock: &MonotonicClock,
+    ) -> Observation {
         let comm = c_array_to_string(&info.pbi_comm);
         let name = c_array_to_string(&info.pbi_name);
         let start_unix_secs = info.pbi_start_tvsec;
@@ -90,7 +113,8 @@ mod imp {
     }
 
     pub(super) fn c_array_to_string<const N: usize>(arr: &[std::os::raw::c_char; N]) -> String {
-        let bytes: Vec<u8> = arr.iter()
+        let bytes: Vec<u8> = arr
+            .iter()
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8)
             .collect();
@@ -143,7 +167,11 @@ mod tests {
             count += 1;
             if obs.pid == Some(my_pid) {
                 saw_self = true;
-                let comm = obs.payload.get("comm").and_then(|v| v.as_str()).unwrap_or("");
+                let comm = obs
+                    .payload
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 assert!(!comm.is_empty(), "comm should be non-empty for own pid");
             }
         }

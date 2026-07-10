@@ -32,7 +32,7 @@ If a change in Layer 1 starts inferring meaning, merging signals, or detecting a
 The apps layer reads Layers 2/3/4 and is allowed to do everything the kernel must not: infer, narrate, score, detect, summarize. Apps must never feed back into Layer 1–3 outputs; the kernel remains the source of truth.
 
 - `aw-llm` — local model client. Currently wraps Ollama over HTTP; behind an `LlmClient` trait so apps can be tested without a live model.
-- `aw-agents` — readers that consume Layer 2 events and/or Layer 3/4 graph state and call an `LlmClient`. Implemented: `TimelineNarrator` (focus segments → narrative), `ProcessAnomalyDetector` (lineage/uid/name heuristics), `NetworkReviewer` (notable connections), `DnsReviewer` (notable DNS names/query patterns).
+- `aw-agents` — readers that consume Layer 2 events and/or Layer 3/4 graph state and call an `LlmClient`. Implemented: `TimelineNarrator` (window facts + novelty + anomaly flags → anomalies-first narrative), `ProcessAnomalyDetector` (lineage/uid/name heuristics), `NetworkReviewer` (notable connections), `DnsReviewer` (notable DNS names/query patterns).
 - `aw-mvp` — end-to-end runner: spins all Layer 1 adapters, drives the Layer 2 reconstructor, materializes the Layer 3 graph, persists to Layer 4, and invokes agents. One-shot or `--daemon` mode. The daemon is service-grade: single-instance `flock` on the store, SIGTERM-clean shutdown (launchd-compatible), heartbeat in store meta (shown by `aw-query summary`), hourly self-pruning via `--retention-days` (default 30), `--no-narrate` collector mode needing no Ollama, and `--print-launchd-plist` for installation as a LaunchAgent.
 
 Agents take `Arc<dyn LlmClient>`. Tests against the agents layer must use a mock client; never require Ollama at test time.
@@ -84,7 +84,7 @@ Kernel (Layers 1–3) and the persistence layer (Layer 4):
 Apps layer (everything below this line may infer, narrate, or judge):
 
 - `crates/aw-llm` — local model client. Wraps Ollama over HTTP (`reqwest`); single `generate()` method on the `LlmClient` trait. Trait exists so apps can be tested with a mock client.
-- `crates/aw-agents` — readers over Layer 2/3/4. `TimelineNarrator` builds a `CaptureSummary` (focus segments, top processes, endpoints, directories, DNS clients) and narrates it; `ProcessAnomalyDetector`, `NetworkReviewer`, and `DnsReviewer` flag notable items via the same `LlmClient`.
+- `crates/aw-agents` — readers over Layer 2/3/4. `TimelineNarrator` builds a `CaptureSummary` (focus segments, top processes, endpoints incl. still-open connections, directories, DNS clients, per-kind event mix) plus store-backed novelty ("never seen before on this machine") and rule-based suspicion flags (privilege-escalation shape, untrusted exec paths, prolific parents, sensitive-port connections, short-lived process bursts, heavy DNS fan-out), and narrates it anomalies-first; `ProcessAnomalyDetector`, `NetworkReviewer`, and `DnsReviewer` flag notable items via the same `LlmClient`.
 
 Binaries:
 
