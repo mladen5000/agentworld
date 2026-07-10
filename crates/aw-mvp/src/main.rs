@@ -39,7 +39,7 @@ use aw_dns::DnsAdapter;
 use aw_eslogger::EsLoggerAdapter;
 use aw_events::{Event, Reconstructor};
 use aw_fsevents::FsEventsAdapter;
-use aw_graph::GraphBuilder;
+use aw_graph::{analytics, GraphBuilder};
 use aw_llm::OllamaClient;
 use aw_network::NetworkAdapter;
 use aw_process::ProcessAdapter;
@@ -329,6 +329,7 @@ async fn run_one_shot(args: Args) -> Result<()> {
     report_capture_health("aw-mvp", &source_counts, &bus);
 
     let graph = build_graph(&events);
+    print_topology_summary(&graph);
 
     // Persist the capture (graph + event history) BEFORE any LLM call so an
     // unreachable or slow model can't lose it. `merge_graph` is idempotent:
@@ -421,6 +422,39 @@ fn build_graph(events: &[Event]) -> aw_graph::Graph {
         builder.on_event(ev);
     }
     builder.build()
+}
+
+/// Print the graph's structural shape (degree centrality + connected
+/// components) to stdout, mirroring `aw-query topology`'s output — so the
+/// one-shot capture path surfaces Layer 3 shape without a separate store
+/// query. Read-only: computed straight from the in-memory `Graph`.
+const TOPOLOGY_TOP_N: usize = 10;
+
+fn print_topology_summary(graph: &aw_graph::Graph) {
+    let adj = analytics::Adjacency::from_graph(graph);
+    let degree = analytics::degree_centrality(&adj);
+    let mut top_by_degree: Vec<(String, u64)> = degree
+        .into_iter()
+        .map(|(node, d)| (node.label(graph), d))
+        .collect();
+    top_by_degree.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_by_degree.truncate(TOPOLOGY_TOP_N);
+
+    let components = analytics::connected_components(&adj);
+    let mut sizes = analytics::component_sizes(&components);
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+
+    println!("--- topology ---");
+    println!(
+        "{} connected components (largest: {})",
+        components.len(),
+        sizes.first().copied().unwrap_or(0),
+    );
+    println!("top {} by degree centrality:", top_by_degree.len());
+    for (label, degree) in &top_by_degree {
+        println!("  {label:<50} degree {degree}");
+    }
+    println!();
 }
 
 async fn capture_for_duration(
