@@ -103,6 +103,35 @@ pub struct CaptureSummary {
     /// short human-readable strings. Empty = nothing flagged.
     #[serde(default)]
     pub suspicions: Vec<String>,
+
+    /// Baseline-scored suspicions (see [`crate::baseline`]), highest score
+    /// first. When present these render with their numeric score so the
+    /// model can rank; `suspicions` stays populated as the plain-text
+    /// fallback for callers without a store.
+    #[serde(default)]
+    pub scored_suspicions: Vec<ScoredSuspicion>,
+
+    /// Structural facts about the graph's shape (degree centrality,
+    /// connected components). `None` when built from raw events with no
+    /// `Graph` available (see [`summarize_capture`]).
+    #[serde(default)]
+    pub graph_analytics: Option<GraphAnalyticsSummary>,
+}
+
+/// Descriptive (non-anomaly) graph-shape facts, prompt-ready.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphAnalyticsSummary {
+    /// Node label paired with its unweighted degree, highest first.
+    pub top_by_degree: Vec<(String, u64)>,
+    pub component_count: usize,
+    pub largest_component_size: usize,
+}
+
+/// One suspicion with its anomaly score, prompt-ready.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredSuspicion {
+    pub text: String,
+    pub score: f64,
 }
 
 /// What in this window was never seen before, per entity kind. Lists are
@@ -270,27 +299,28 @@ impl TimelineNarrator {
 
         let system_text = if self.live {
             "You are narrating live macOS activity in the present, for the user who \
-             is at the keyboard right now. If the prompt lists ANOMALY FLAGS or \
-             NEVER-SEEN-BEFORE items, open with the most significant of those and \
-             say concretely why it stands out (many flags are benign dev tooling — \
-             use judgement, don't alarm over cargo/git/editor helpers). Then be \
-             concrete and human about the rest: what they ARE doing (dominant app + \
-             apparent purpose), notable network destinations, any other striking \
-             signal from the last few minutes. Use present-perfect tense (\"you've \
-             been …\") when describing how long activity has lasted. Keep it to 2–5 \
-             sentences. Do NOT speculate beyond the data. Do NOT output bullet \
-             points or JSON — plain prose only."
+             is at the keyboard right now. Output ONLY a bulleted list — every line \
+             starts with \"- \"; no prose paragraphs, no JSON, no headers. If the \
+             prompt lists ANOMALY FLAGS or NEVER-SEEN-BEFORE items, those bullets \
+             come FIRST, in descending score order, each prefixed \"ANOMALY: \" and \
+             saying concretely why it stands out (many flags are benign dev tooling \
+             — use judgement, don't alarm over cargo/git/editor helpers). Then 2–4 \
+             routine-activity bullets: what they ARE doing (dominant app + apparent \
+             purpose), notable network destinations, any other striking signal from \
+             the last few minutes. One sentence per bullet, present-perfect tense \
+             (\"you've been …\") for durations. Do NOT speculate beyond the data."
         } else {
             "You are summarising a short macOS behavioural capture in plain English \
-             for the user who was at the keyboard. If the prompt lists ANOMALY \
-             FLAGS or NEVER-SEEN-BEFORE items, open with the most significant of \
-             those and say concretely why it stands out (many flags are benign dev \
-             tooling — use judgement). Then be concrete and human about the rest: \
-             the dominant app(s) and what they appear to have been used for, \
-             notable network destinations, any other striking signal. Keep it to \
-             3–6 sentences. Speak in second person (\"you were …\"). Do NOT \
-             speculate beyond the data. Do NOT output bullet points or JSON — \
-             plain prose only."
+             for the user who was at the keyboard. Output ONLY a bulleted list — \
+             every line starts with \"- \"; no prose paragraphs, no JSON, no \
+             headers. If the prompt lists ANOMALY FLAGS or NEVER-SEEN-BEFORE items, \
+             those bullets come FIRST, in descending score order, each prefixed \
+             \"ANOMALY: \" and saying concretely why it stands out (many flags are \
+             benign dev tooling — use judgement). Then 2–4 routine-activity \
+             bullets: the dominant app(s) and what they appear to have been used \
+             for, notable network destinations, any other striking signal. One \
+             sentence per bullet, second person (\"you were …\"). Do NOT speculate \
+             beyond the data."
         };
         let system = Some(system_text.to_string());
 
@@ -332,6 +362,8 @@ pub fn summarize_capture(events: &[Event]) -> CaptureSummary {
             kind_counts: Vec::new(),
             novelty: None,
             suspicions: Vec::new(),
+            scored_suspicions: Vec::new(),
+            graph_analytics: None,
         };
     }
 
@@ -359,6 +391,8 @@ pub fn summarize_capture(events: &[Event]) -> CaptureSummary {
         kind_counts: kind_counts(events),
         novelty: None,
         suspicions: event_suspicions(events),
+        scored_suspicions: Vec::new(),
+        graph_analytics: None,
     }
 }
 
@@ -389,6 +423,8 @@ pub fn summarize_graph(g: &aw_graph::Graph) -> CaptureSummary {
             kind_counts: Vec::new(),
             novelty: None,
             suspicions: Vec::new(),
+            scored_suspicions: Vec::new(),
+            graph_analytics: None,
         };
     }
 
@@ -458,6 +494,36 @@ pub fn summarize_graph(g: &aw_graph::Graph) -> CaptureSummary {
         ],
         novelty: None,
         suspicions: Vec::new(),
+        scored_suspicions: Vec::new(),
+        graph_analytics: Some(graph_analytics_summary(g)),
+    }
+}
+
+/// Top-N nodes by unweighted degree, plus connected-component shape, as a
+/// prompt-ready descriptive (non-anomaly) fact set. Judgment about what
+/// counts as anomalous shape lives in [`crate::topology`], not here.
+fn graph_analytics_summary(g: &aw_graph::Graph) -> GraphAnalyticsSummary {
+    use aw_graph::analytics;
+
+    const TOP_N: usize = 5;
+
+    let adj = analytics::Adjacency::from_graph(g);
+    let degree = analytics::degree_centrality(&adj);
+    let mut top_by_degree: Vec<(String, u64)> = degree
+        .into_iter()
+        .map(|(node, d)| (node.label(g), d))
+        .collect();
+    top_by_degree.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_by_degree.truncate(TOP_N);
+
+    let components = analytics::connected_components(&adj);
+    let sizes = analytics::component_sizes(&components);
+    let largest_component_size = sizes.into_iter().max().unwrap_or(0);
+
+    GraphAnalyticsSummary {
+        top_by_degree,
+        component_count: components.len(),
+        largest_component_size,
     }
 }
 
@@ -984,9 +1050,37 @@ fn render_prompt(s: &CaptureSummary, live: bool) -> String {
         out.push_str(&format!("EVENT MIX: {}\n\n", mix.join(" ")));
     }
 
+    if let Some(ga) = &s.graph_analytics {
+        let top: Vec<String> = ga
+            .top_by_degree
+            .iter()
+            .map(|(label, degree)| format!("{label} (degree {degree})"))
+            .collect();
+        out.push_str(&format!(
+            "GRAPH SHAPE: {} connected components (largest: {} entities); most-connected: {}\n\n",
+            ga.component_count,
+            ga.largest_component_size,
+            if top.is_empty() {
+                "none".to_string()
+            } else {
+                top.join(", ")
+            },
+        ));
+    }
+
     // Anomalies lead: flags and novelty come before routine activity so the
-    // model weights them first.
-    if !s.suspicions.is_empty() {
+    // model weights them first. Scored flags carry their numeric score so
+    // the model can rank; the plain list is the storeless fallback.
+    if !s.scored_suspicions.is_empty() {
+        out.push_str(
+            "ANOMALY FLAGS (scored against this machine's baseline, highest first; \
+             some may be benign dev tooling — judge each):\n",
+        );
+        for f in &s.scored_suspicions {
+            out.push_str(&format!("  - [score {:.1}] {}\n", f.score, f.text));
+        }
+        out.push('\n');
+    } else if !s.suspicions.is_empty() {
         out.push_str(
             "ANOMALY FLAGS (rule-based, pre-computed; some may be benign dev tooling — judge each):\n",
         );
@@ -1087,18 +1181,27 @@ fn render_prompt(s: &CaptureSummary, live: bool) -> String {
         out.push('\n');
     }
 
-    let has_anomalies =
-        !s.suspicions.is_empty() || s.novelty.as_ref().is_some_and(|n| n.has_novelty());
+    let has_anomalies = !s.suspicions.is_empty()
+        || !s.scored_suspicions.is_empty()
+        || s.novelty.as_ref().is_some_and(|n| n.has_novelty());
     if has_anomalies {
         out.push_str(
-            "Lead with the most significant anomaly flag or first-time-seen item and say \
-             plainly why it stands out, then cover the routine activity. ",
+            "Open with the anomaly flags and first-time-seen items as \"- ANOMALY: …\" \
+             bullets in descending score order, each saying plainly why it stands out. ",
         );
     }
     if live {
-        out.push_str("Write 2–5 sentences of present-tense prose addressed to the user.\n");
+        out.push_str(
+            "Respond with ONLY a bulleted list addressed to the user — every line \
+             starts with \"- \", one present-tense sentence per bullet, 2–4 bullets \
+             for the routine activity; no prose paragraphs.\n",
+        );
     } else {
-        out.push_str("Write 3–6 sentences of plain prose addressed to the user.\n");
+        out.push_str(
+            "Respond with ONLY a bulleted list addressed to the user — every line \
+             starts with \"- \", one sentence per bullet, 2–4 bullets for the \
+             routine activity; no prose paragraphs.\n",
+        );
     }
     out
 }
@@ -1557,7 +1660,8 @@ mod tests {
         );
 
         let _ = agent.run_summary(summary).await.unwrap();
-        let prompt = &mock.calls()[0].prompt;
+        let call = &mock.calls()[0];
+        let prompt = &call.prompt;
         assert!(prompt.contains("ANOMALY FLAGS"), "prompt: {prompt}");
         assert!(prompt.contains("root process 'rooted'"), "prompt: {prompt}");
         assert!(
@@ -1568,14 +1672,154 @@ mod tests {
             prompt.contains("new process: miner (/tmp/miner)"),
             "prompt: {prompt}"
         );
+        // The bulleted-list contract: anomalies open the list, and the
+        // closing instruction demands bullets, not prose.
         assert!(
-            prompt.contains("Lead with the most significant anomaly"),
+            prompt.contains("Open with the anomaly flags"),
             "prompt: {prompt}"
         );
+        assert!(prompt.contains("ONLY a bulleted list"), "prompt: {prompt}");
         // Anomalies must come before routine activity in the prompt.
         let flags_at = prompt.find("ANOMALY FLAGS").unwrap();
         let focus_at = prompt.find("APP FOCUS").unwrap();
         assert!(flags_at < focus_at, "flags should precede focus: {prompt}");
+        // The system prompt carries the same contract and no prose demand.
+        let system = call.system.as_deref().unwrap_or("");
+        assert!(system.contains("ONLY a bulleted list"), "system: {system}");
+        assert!(system.contains("ANOMALY: "), "system: {system}");
+        assert!(!system.contains("plain prose only"), "system: {system}");
+    }
+
+    #[test]
+    fn summarize_graph_populates_graph_analytics() {
+        use aw_graph::{Edge, Graph, ProcessId, ProcessNode};
+
+        fn ts(n: u64) -> aw_core::Timestamp {
+            aw_core::Timestamp {
+                mono_ns: n,
+                wall_anchor_ns: 0,
+            }
+        }
+        fn pid(n: u32) -> ProcessId {
+            ProcessId {
+                pid: n,
+                start_unix_secs: 1,
+            }
+        }
+        fn proc(id: ProcessId, ppid: Option<u32>) -> ProcessNode {
+            ProcessNode {
+                id,
+                comm: Some("proc".into()),
+                name: None,
+                exec_path: None,
+                ppid,
+                uid: Some(501),
+                birth: ts(0),
+                death: None,
+            }
+        }
+
+        let graph = Graph {
+            processes: vec![proc(pid(1), None), proc(pid(2), Some(1)), proc(pid(3), Some(1))],
+            edges: vec![
+                Edge::ParentOf {
+                    parent: pid(1),
+                    child: pid(2),
+                },
+                Edge::ParentOf {
+                    parent: pid(1),
+                    child: pid(3),
+                },
+            ],
+            ..Graph::default()
+        };
+
+        let summary = summarize_graph(&graph);
+        let ga = summary.graph_analytics.expect("graph path must populate analytics");
+        assert_eq!(ga.component_count, 1);
+        assert_eq!(ga.largest_component_size, 3);
+        assert_eq!(ga.top_by_degree[0].0, "proc (pid 1)");
+        assert_eq!(ga.top_by_degree[0].1, 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_renders_graph_shape_between_event_mix_and_anomaly_flags() {
+        let mock = Arc::new(MockClient::new(vec!["Shape noted."]));
+        let agent = TimelineNarrator::new(AgentCtx::new(mock.clone(), AgentConfig::default()));
+
+        let mut summary = summarize_capture(&[ev(
+            EventKind::AppFocus,
+            0,
+            None,
+            json!({"to_name": "Code", "to_bundle_id": "com.microsoft.VSCode"}),
+        )]);
+        summary.graph_analytics = Some(GraphAnalyticsSummary {
+            top_by_degree: vec![("launchd (pid 1)".to_string(), 12)],
+            component_count: 3,
+            largest_component_size: 12,
+        });
+        summary
+            .suspicions
+            .push("sensitive port connection to 1.2.3.4:22".into());
+
+        let _ = agent.run_summary(summary).await.unwrap();
+        let call = &mock.calls()[0];
+        let prompt = &call.prompt;
+        assert!(prompt.contains("GRAPH SHAPE"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("launchd (pid 1) (degree 12)"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("3 connected components"), "prompt: {prompt}");
+
+        let mix_at = prompt.find("EVENT MIX").unwrap();
+        let shape_at = prompt.find("GRAPH SHAPE").unwrap();
+        let flags_at = prompt.find("ANOMALY FLAGS").unwrap();
+        assert!(
+            mix_at < shape_at && shape_at < flags_at,
+            "expected EVENT MIX < GRAPH SHAPE < ANOMALY FLAGS: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_renders_scored_suspicions_with_scores() {
+        let mock = Arc::new(MockClient::new(vec!["- ANOMALY: spike."]));
+        let agent =
+            TimelineNarrator::new(AgentCtx::new(mock.clone(), AgentConfig::default())).live();
+
+        let mut summary = summarize_capture(&[ev(
+            EventKind::AppFocus,
+            0,
+            None,
+            json!({"to_name": "Code", "to_bundle_id": "com.microsoft.VSCode"}),
+        )]);
+        summary.scored_suspicions = vec![
+            ScoredSuspicion {
+                text: "'nc' connected to 1.2.3.4.4444 — port 4444".into(),
+                score: 7.0,
+            },
+            ScoredSuspicion {
+                text: "'chrome' issued 40 DNS queries".into(),
+                score: 3.5,
+            },
+        ];
+        summary.suspicions = summary
+            .scored_suspicions
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+
+        let _ = agent.run_summary(summary).await.unwrap();
+        let prompt = &mock.calls()[0].prompt;
+        assert!(
+            prompt.contains("scored against this machine's baseline"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains("[score 7.0] 'nc'"), "prompt: {prompt}");
+        assert!(prompt.contains("[score 3.5] 'chrome'"), "prompt: {prompt}");
+        let hi = prompt.find("[score 7.0]").unwrap();
+        let lo = prompt.find("[score 3.5]").unwrap();
+        assert!(hi < lo, "scored flags must render descending: {prompt}");
     }
 
     #[tokio::test]

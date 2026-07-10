@@ -32,6 +32,7 @@ use aw_events::SCHEMA_VERSION;
 use aw_events::{Event, EventKind};
 use serde::{Deserialize, Serialize};
 
+pub mod analytics;
 pub mod dot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

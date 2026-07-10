@@ -18,11 +18,13 @@ use std::sync::Arc;
 use aw_llm::LlmClient;
 use serde::{Deserialize, Serialize};
 
+pub mod baseline;
 pub mod dns_reviewer;
 pub mod input;
 pub mod network_reviewer;
 pub mod process_anomaly;
 pub mod timeline_narrator;
+pub mod topology;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {

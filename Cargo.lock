@@ -197,6 +197,7 @@ dependencies = [
  "aw-system",
  "aw-window",
  "libc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -208,6 +209,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aw-core",
+ "libc",
+ "libproc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -241,6 +245,7 @@ dependencies = [
  "async-trait",
  "aw-core",
  "libproc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -262,7 +267,9 @@ dependencies = [
 name = "aw-scheduler"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aw-core",
+ "serde_json",
  "tokio",
  "tracing",
 ]

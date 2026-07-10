@@ -198,6 +198,37 @@ pub struct MergeReport {
     pub edges_updated: u64,
 }
 
+/// One row of [`Store::event_hourly_profile`]: how many events of `kind`
+/// fell in UTC hour-of-day `hour_of_day` since the query's cutoff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyKindCount {
+    pub kind: String,
+    pub hour_of_day: u8,
+    pub count: u64,
+}
+
+/// One row of [`Store::event_field_window_counts`]: how many events of the
+/// queried kind carried `value` in the queried payload field, per time
+/// window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldWindowCount {
+    pub value: String,
+    pub window_start_unix_ns: i64,
+    pub count: u64,
+}
+
+/// One row of [`Store::edge_rates`]: an edge's raw observation tally and the
+/// wall-clock span it was tallied over. `count / span` is the caller's rate;
+/// the store only reports the mechanical columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeRate {
+    pub from_id: String,
+    pub to_id: String,
+    pub count: u64,
+    pub first_seen_unix_ns: i64,
+    pub last_seen_unix_ns: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -1503,6 +1534,86 @@ impl Store {
         Ok(out)
     }
 
+    /// Mechanical aggregate: per-kind event counts bucketed by UTC hour of
+    /// day, over everything at or after `from_unix_ns`. Pure counting — no
+    /// thresholds, no interpretation; the apps layer turns this into
+    /// hour-of-day frequency profiles.
+    pub fn event_hourly_profile(&self, from_unix_ns: i64) -> Result<Vec<HourlyKindCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, (ts_unix_ns / 3600000000000) % 24 AS hod, COUNT(*)
+             FROM events
+             WHERE ts_unix_ns >= ?1
+             GROUP BY kind, hod
+             ORDER BY kind, hod",
+        )?;
+        let rows = stmt.query_map(params![from_unix_ns], |r| {
+            Ok(HourlyKindCount {
+                kind: r.get(0)?,
+                hour_of_day: r.get::<_, i64>(1)? as u8,
+                count: r.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Mechanical aggregate: for events of `kind` at or after `from_unix_ns`,
+    /// count occurrences of each distinct string value of payload field
+    /// `json_field` per `window_ns`-wide time bucket. Rows with the field
+    /// absent are skipped. E.g. per-hour counts of `process_death.comm` or
+    /// `dns_query.process_name` — the raw material for per-entity baselines.
+    pub fn event_field_window_counts(
+        &self,
+        kind: EventKind,
+        json_field: &str,
+        from_unix_ns: i64,
+        window_ns: i64,
+    ) -> Result<Vec<FieldWindowCount>> {
+        let kind = event_kind_to_string(kind)?;
+        let path = format!("$.{json_field}");
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(payload, ?4) AS v,
+                    (ts_unix_ns / ?3) * ?3 AS win,
+                    COUNT(*)
+             FROM events
+             WHERE kind = ?1 AND ts_unix_ns >= ?2
+               AND json_extract(payload, ?4) IS NOT NULL
+             GROUP BY v, win
+             ORDER BY v, win",
+        )?;
+        let rows = stmt.query_map(params![kind, from_unix_ns, window_ns, path], |r| {
+            Ok(FieldWindowCount {
+                value: r.get(0)?,
+                window_start_unix_ns: r.get(1)?,
+                count: r.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Mechanical aggregate: every edge of `kind` with its raw observation
+    /// tally and observed lifespan, straight off existing columns. Lifetime
+    /// rate = `count / (last_seen - first_seen)` is computed by the caller.
+    pub fn edge_rates(&self, kind: &str) -> Result<Vec<EdgeRate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_id, to_id, count, first_seen, last_seen
+             FROM edges
+             WHERE kind = ?1",
+        )?;
+        let rows = stmt.query_map(params![kind], |r| {
+            Ok(EdgeRate {
+                from_id: r.get(0)?,
+                to_id: r.get(1)?,
+                count: r.get::<_, i64>(2)? as u64,
+                first_seen_unix_ns: r.get(3)?,
+                last_seen_unix_ns: r.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Retention: delete every node and edge whose `last_seen` is strictly
     /// before `cutoff_unix_ns`, any edge left dangling because one of its
     /// endpoints was deleted, and every event older than the cutoff. The
@@ -2613,6 +2724,78 @@ mod tests {
             pid,
             payload: serde_json::json!({ "marker": secs }),
         }
+    }
+
+    fn payload_event(secs: u64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            schema_version: aw_events::SCHEMA_VERSION,
+            timestamp: unix_ts(secs),
+            kind,
+            pid: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn hourly_profile_buckets_by_utc_hour() {
+        let mut s = Store::open_in_memory().unwrap();
+        // Two dns queries in hour 0, one process birth in hour 2 (UTC,
+        // relative to the unix epoch since unix_ts starts at 0).
+        s.append_events(&[
+            sample_event(60, EventKind::DnsQuery, None),
+            sample_event(120, EventKind::DnsQuery, None),
+            sample_event(2 * 3600 + 5, EventKind::ProcessBirth, Some(1)),
+        ])
+        .unwrap();
+
+        let profile = s.event_hourly_profile(0).unwrap();
+        assert_eq!(profile.len(), 2);
+        let dns = profile.iter().find(|r| r.kind == "dns_query").unwrap();
+        assert_eq!((dns.hour_of_day, dns.count), (0, 2));
+        let birth = profile.iter().find(|r| r.kind == "process_birth").unwrap();
+        assert_eq!((birth.hour_of_day, birth.count), (2, 1));
+    }
+
+    #[test]
+    fn field_window_counts_group_by_value_and_window() {
+        let mut s = Store::open_in_memory().unwrap();
+        let q = |name: &str| serde_json::json!({ "process_name": name });
+        s.append_events(&[
+            payload_event(10, EventKind::DnsQuery, q("chrome")),
+            payload_event(20, EventKind::DnsQuery, q("chrome")),
+            payload_event(3610, EventKind::DnsQuery, q("chrome")),
+            payload_event(30, EventKind::DnsQuery, q("curl")),
+            // Different kind and missing field must both be excluded.
+            payload_event(40, EventKind::ProcessBirth, q("chrome")),
+            payload_event(50, EventKind::DnsQuery, serde_json::json!({ "other": 1 })),
+        ])
+        .unwrap();
+
+        let hour_ns: i64 = 3_600_000_000_000;
+        let rows = s
+            .event_field_window_counts(EventKind::DnsQuery, "process_name", 0, hour_ns)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let chrome: Vec<_> = rows.iter().filter(|r| r.value == "chrome").collect();
+        assert_eq!(chrome.len(), 2, "chrome spans two hour windows");
+        assert_eq!(chrome[0].count, 2);
+        assert_eq!(chrome[1].count, 1);
+        assert_eq!(chrome[1].window_start_unix_ns, hour_ns);
+        let curl = rows.iter().find(|r| r.value == "curl").unwrap();
+        assert_eq!(curl.count, 1);
+    }
+
+    #[test]
+    fn edge_rates_read_existing_columns() {
+        let mut s = Store::open_in_memory().unwrap();
+        let g = small_graph();
+        s.merge_graph(&g).unwrap();
+        s.merge_graph(&g).unwrap(); // second merge bumps count
+
+        let rates = s.edge_rates("parent_of").unwrap();
+        assert_eq!(rates.len(), 1);
+        assert!(rates[0].count >= 2, "repeat merge must bump the tally");
+        assert!(rates[0].last_seen_unix_ns >= rates[0].first_seen_unix_ns);
     }
 
     #[test]

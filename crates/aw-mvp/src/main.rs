@@ -17,17 +17,22 @@
 //!   total in one-shot). Pipe-friendly.
 //! - `stderr`: status + tracing. Quiet by default; raise with `RUST_LOG`.
 
+mod pipeline;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use aw_agents::baseline::BaselineEngine;
 use aw_agents::process_anomaly::{
     suspicion_flags_from_store, ProcessAnomalyDetector, DEFAULT_PROLIFIC_PARENT_THRESHOLD,
     DEFAULT_TRUSTED_PATH_PREFIXES,
 };
-use aw_agents::timeline_narrator::{summarize_capture, NoveltySummary, TimelineNarrator};
+use aw_agents::timeline_narrator::{
+    summarize_capture, NoveltySummary, ScoredSuspicion, TimelineNarrator,
+};
 use aw_agents::{AgentConfig, AgentCtx};
 use aw_core::{Bus, MonotonicClock, Source};
 use aw_dns::DnsAdapter;
@@ -38,7 +43,7 @@ use aw_graph::GraphBuilder;
 use aw_llm::OllamaClient;
 use aw_network::NetworkAdapter;
 use aw_process::ProcessAdapter;
-use aw_scheduler::Scheduler;
+use aw_scheduler::{PollConfig, Scheduler};
 use aw_store::Store;
 use aw_system::SystemAdapter;
 use aw_window::WindowAdapter;
@@ -316,12 +321,12 @@ async fn run_one_shot(args: Args) -> Result<()> {
         args.ollama_url,
     );
 
-    let (events, source_counts) = capture_for_duration(args.duration).await?;
+    let (events, source_counts, bus) = capture_for_duration(args.duration).await?;
     eprintln!(
         "aw-mvp: capture done — {} reconstructed events",
         events.len()
     );
-    report_capture_health("aw-mvp", &source_counts);
+    report_capture_health("aw-mvp", &source_counts, &bus);
 
     let graph = build_graph(&events);
 
@@ -418,7 +423,9 @@ fn build_graph(events: &[Event]) -> aw_graph::Graph {
     builder.build()
 }
 
-async fn capture_for_duration(duration: Duration) -> Result<(Vec<Event>, HashMap<Source, u64>)> {
+async fn capture_for_duration(
+    duration: Duration,
+) -> Result<(Vec<Event>, HashMap<Source, u64>, Bus)> {
     let clock = Arc::new(MonotonicClock::new());
     let (bus, mut rx) = Bus::channel();
     let mut scheduler = build_scheduler(clock.clone(), bus.clone());
@@ -447,7 +454,7 @@ async fn capture_for_duration(duration: Duration) -> Result<(Vec<Event>, HashMap
     }
 
     scheduler.shutdown();
-    Ok((events, source_counts))
+    Ok((events, source_counts, bus))
 }
 
 /// Every Layer 1 source category, with its snake_case display name. Used to
@@ -463,7 +470,7 @@ const ALL_SOURCES: [(&str, Source); 5] = [
 
 /// One stderr line of per-source observation counts, plus a warning naming
 /// any source that stayed completely silent.
-fn report_capture_health(prefix: &str, counts: &HashMap<Source, u64>) {
+fn report_capture_health(prefix: &str, counts: &HashMap<Source, u64>, bus: &Bus) {
     let mut parts = Vec::new();
     let mut silent = Vec::new();
     for (name, src) in ALL_SOURCES {
@@ -473,7 +480,17 @@ fn report_capture_health(prefix: &str, counts: &HashMap<Source, u64>) {
         }
         parts.push(format!("{name}={n}"));
     }
+    let dropped = bus.dropped_total();
+    if dropped > 0 {
+        parts.push(format!("dropped={dropped}"));
+    }
     eprintln!("{prefix}: source health: {}", parts.join(" "));
+    if dropped > 0 {
+        eprintln!(
+            "{prefix}: warning — the bus dropped {dropped} observations (consumer \
+             lag); the scheduler will widen poll intervals under sustained pressure.",
+        );
+    }
     if !silent.is_empty() {
         eprintln!(
             "{prefix}: warning — no observations from: {}. On macOS this usually \
@@ -570,6 +587,79 @@ fn enrich_summary_from_store(
     }
 }
 
+/// Cap on suspicion lines fed to the narrator. Mirrors the narrator's own
+/// `MAX_EVENT_SUSPICIONS`.
+const MAX_SUSPICIONS: usize = 8;
+
+/// Score the window against the machine baseline and fold the existing
+/// rule-based flags in underneath: scored anomalies keep their scores, rule
+/// flags not superseded by an identical scored line join at a nominal 1.0,
+/// and the result is sorted descending and capped. `suspicions` is rewritten
+/// in the same order so the no-LLM fallback printer stays consistent.
+fn apply_scored_suspicions(
+    summary: &mut aw_agents::timeline_narrator::CaptureSummary,
+    engine: &BaselineEngine,
+    events: &[Event],
+    now_unix_ns: i64,
+) {
+    let new_scores: Vec<ScoredSuspicion> = engine
+        .score_window(events, now_unix_ns)
+        .into_iter()
+        .map(|a| ScoredSuspicion {
+            text: a.text,
+            score: a.score,
+        })
+        .collect();
+    merge_scored_suspicions(summary, new_scores);
+}
+
+/// Structural (topology) anomaly signal: score the shape difference between
+/// two graph snapshots and fold the result into `summary.scored_suspicions`
+/// via the same merge/sort/truncate rule `apply_scored_suspicions` uses, so
+/// statistical and structural flags share one ranked list.
+fn apply_topology_suspicions(
+    summary: &mut aw_agents::timeline_narrator::CaptureSummary,
+    prev_graph: &aw_graph::Graph,
+    curr_graph: &aw_graph::Graph,
+) {
+    let new_scores: Vec<ScoredSuspicion> = aw_agents::topology::score_snapshot_diff(prev_graph, curr_graph)
+        .into_iter()
+        .map(|a| ScoredSuspicion {
+            text: a.text,
+            score: a.score,
+        })
+        .collect();
+    merge_scored_suspicions(summary, new_scores);
+}
+
+/// Fold `new_scores` into `summary`'s existing scored/rule-based suspicions:
+/// existing scored suspicions and any plain-text rule flags not superseded
+/// by an identical scored line join `new_scores` at a nominal 1.0, then the
+/// combined list is sorted descending and capped. `suspicions` is rewritten
+/// in the same order so the no-LLM fallback printer stays consistent.
+fn merge_scored_suspicions(
+    summary: &mut aw_agents::timeline_narrator::CaptureSummary,
+    mut scored: Vec<ScoredSuspicion>,
+) {
+    for existing in summary.scored_suspicions.drain(..) {
+        if !scored.iter().any(|s| s.text == existing.text) {
+            scored.push(existing);
+        }
+    }
+    for f in summary.suspicions.drain(..) {
+        if !scored.iter().any(|s| s.text == f) {
+            scored.push(ScoredSuspicion {
+                text: f,
+                score: 1.0,
+            });
+        }
+    }
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored.truncate(MAX_SUSPICIONS);
+    summary.suspicions = scored.iter().map(|s| s.text.clone()).collect();
+    summary.scored_suspicions = scored;
+}
+
 /// Wall-clock now in unix nanoseconds — the encoding the store uses.
 fn now_unix_ns() -> i64 {
     std::time::SystemTime::now()
@@ -609,9 +699,11 @@ async fn run_daemon(args: Args) -> Result<()> {
     };
 
     let clock = Arc::new(MonotonicClock::new());
-    let (bus, mut rx) = Bus::channel();
+    let (bus, rx) = Bus::channel();
     let mut scheduler = build_scheduler(clock.clone(), bus.clone());
-    let mut recon = Reconstructor::new();
+    // Staged pipeline: bus drain and Layer 2 reconstruction each run on
+    // their own task, so a slow store write below can't stall ingestion.
+    let (mut recon_rx, drain_stats, mut stage_handles) = pipeline::spawn(rx);
 
     // Sliding-window buffer. `mono_ns` on event timestamps is monotonic from
     // process start, so we can evict by `front().mono_ns < cutoff` without
@@ -680,6 +772,18 @@ async fn run_daemon(args: Args) -> Result<()> {
     let mut last_prune: Option<std::time::Instant> = None;
     let retention_ns = (args.retention_days as i64) * 86_400 * 1_000_000_000;
 
+    // Machine baseline for anomaly scoring, rebuilt at most hourly (same
+    // cadence as pruning). `None` until the first narrated tick with a store.
+    let mut baseline: Option<(BaselineEngine, std::time::Instant)> = None;
+    // Previous tick's graph snapshot, kept purely to diff structural shape
+    // against the current tick (aw_agents::topology::score_snapshot_diff).
+    // `None` on the first tick — there's nothing yet to diff against.
+    let mut prev_graph_snapshot: Option<aw_graph::Graph> = None;
+    let baseline_lookback_days: u32 = match args.retention_days {
+        0 => 30,
+        d => d.min(30) as u32,
+    };
+
     loop {
         tokio::select! {
             biased;
@@ -706,9 +810,17 @@ async fn run_daemon(args: Args) -> Result<()> {
                 // After a successful merge, trim in-memory nodes older than
                 // `store_ttl` relative to the newest event we hold. The store
                 // retains them; this only caps daemon RAM growth.
+                // This tick's graph snapshot, stashed outside the merge block
+                // below so it survives to (a) become `prev_graph_snapshot` for
+                // next tick's structural diff, and (b) feed topology scoring
+                // against the previous tick's snapshot further down.
+                let mut curr_graph_snapshot: Option<aw_graph::Graph> = None;
                 if let Some((store, builder, path)) = store_and_builder.as_mut() {
                     let snapshot = builder.snapshot();
-                    match store.merge_graph(&snapshot) {
+                    // rusqlite is synchronous; `block_in_place` keeps a slow
+                    // WAL write from stalling the other tasks (drain,
+                    // reconstruction) multiplexed on this worker thread.
+                    match tokio::task::block_in_place(|| store.merge_graph(&snapshot)) {
                         Ok(report) => {
                             let trimmed = if let Some(newest) = window.back().map(|e| e.timestamp.mono_ns) {
                                 let ttl_ns = args.store_ttl.as_nanos() as u64;
@@ -725,12 +837,13 @@ async fn run_daemon(args: Args) -> Result<()> {
                         }
                         Err(e) => eprintln!("aw-mvp: store merge failed: {e}"),
                     }
+                    curr_graph_snapshot = Some(snapshot);
                     // Flush the event history. On failure the batch is
                     // dropped with a warning rather than retried — drop is
                     // preferred over unbounded buffering (same philosophy as
                     // the Layer 1 bus).
                     if !pending_events.is_empty() {
-                        match store.append_events(&pending_events) {
+                        match tokio::task::block_in_place(|| store.append_events(&pending_events)) {
                             Ok(n) => eprintln!("aw-mvp: appended {n} events to history"),
                             Err(e) => eprintln!(
                                 "aw-mvp: event append failed; dropping {} events: {e}",
@@ -740,8 +853,11 @@ async fn run_daemon(args: Args) -> Result<()> {
                         pending_events.clear();
                     }
 
-                    // Heartbeat + hourly retention pass.
+                    // Heartbeat + bus transport counters + hourly retention pass.
                     let _ = store.set_meta("daemon_heartbeat_unix_ns", &now_unix_ns().to_string());
+                    if let Ok(stats_json) = serde_json::to_string(&bus.stats()) {
+                        let _ = store.set_meta("bus_drops_json", &stats_json);
+                    }
                     let prune_due = args.retention_days > 0
                         && last_prune.map(|t| t.elapsed() >= Duration::from_secs(3600)).unwrap_or(true);
                     if prune_due {
@@ -760,7 +876,14 @@ async fn run_daemon(args: Args) -> Result<()> {
                     }
                 }
 
-                report_capture_health("aw-mvp", &tick_sources);
+                report_capture_health("aw-mvp", &tick_sources, &bus);
+                let pipe_dropped = drain_stats.dropped_total();
+                if pipe_dropped > 0 {
+                    eprintln!(
+                        "aw-mvp: warning — pipeline dropped {pipe_dropped} observations \
+                         between drain and reconstruction (reconstructor lag)",
+                    );
+                }
                 tick_sources.clear();
 
                 if args.no_narrate {
@@ -781,6 +904,42 @@ async fn run_daemon(args: Args) -> Result<()> {
                 if let Some((store, _, _)) = store_and_builder.as_ref() {
                     let from_unix_ns = now_unix_ns().saturating_sub(window_ns as i64);
                     enrich_summary_from_store(&mut summary, store, from_unix_ns);
+
+                    // Rebuild the anomaly baseline at most hourly, then score
+                    // this window against it. Failures degrade to the plain
+                    // rule flags — never block narration.
+                    let stale = baseline
+                        .as_ref()
+                        .map(|(_, at)| at.elapsed() >= Duration::from_secs(3600))
+                        .unwrap_or(true);
+                    if stale {
+                        match tokio::task::block_in_place(|| {
+                            BaselineEngine::from_store(store, now_unix_ns(), baseline_lookback_days)
+                        }) {
+                            Ok(engine) => {
+                                if engine.is_cold() {
+                                    eprintln!(
+                                        "aw-mvp: anomaly baseline still cold — using fixed thresholds",
+                                    );
+                                }
+                                baseline = Some((engine, std::time::Instant::now()));
+                            }
+                            Err(e) => eprintln!("aw-mvp: baseline rebuild failed: {e}"),
+                        }
+                    }
+                    if let Some((engine, _)) = baseline.as_ref() {
+                        apply_scored_suspicions(&mut summary, engine, &snapshot, now_unix_ns());
+                    }
+                }
+                // Structural (topology) anomaly signal: diff this tick's
+                // graph shape against last tick's. Folds into the same
+                // scored-suspicions list via `apply_topology_suspicions` so
+                // the LLM sees one ranked list, not two it must reconcile.
+                if let (Some(prev), Some(curr)) = (prev_graph_snapshot.as_ref(), curr_graph_snapshot.as_ref()) {
+                    apply_topology_suspicions(&mut summary, prev, curr);
+                }
+                if let Some(curr) = curr_graph_snapshot {
+                    prev_graph_snapshot = Some(curr);
                 }
                 // The computed flags must survive an LLM outage — a watcher
                 // wouldn't go blind just because the narrator lost its voice.
@@ -813,16 +972,16 @@ async fn run_daemon(args: Args) -> Result<()> {
                     }
                 }));
             }
-            maybe = rx.recv() => match maybe {
-                Some(obs) => {
-                    *tick_sources.entry(obs.source).or_insert(0) += 1;
+            maybe = recon_rx.recv() => match maybe {
+                Some(out) => {
+                    *tick_sources.entry(out.obs.source).or_insert(0) += 1;
                     // Also feed the raw observation to the graph builder so
                     // app-focus intervals (which derive from `Window` source
                     // observations, not Layer 2 events) get captured.
                     if let Some((_, builder, _)) = store_and_builder.as_mut() {
-                        builder.on_observation(&obs);
+                        builder.on_observation(&out.obs);
                     }
-                    for ev in recon.process(&obs) {
+                    for ev in out.events {
                         if let Some((_, builder, _)) = store_and_builder.as_mut() {
                             builder.on_event(&ev);
                         }
@@ -849,6 +1008,11 @@ async fn run_daemon(args: Args) -> Result<()> {
     }
 
     scheduler.shutdown();
+    // Stop the pipeline stages. In-flight observations may be lost — per
+    // §8.3 that is acceptable; everything already consumed is merged below.
+    for h in stage_handles.drain(..) {
+        h.abort();
+    }
 
     // Final merge so the events ingested since the last tick aren't lost on
     // Ctrl-C. Safe to re-run because merge is idempotent.
@@ -895,12 +1059,28 @@ async fn run_daemon(args: Args) -> Result<()> {
 
 fn build_scheduler(clock: Arc<MonotonicClock>, bus: Bus) -> Scheduler {
     let mut scheduler = Scheduler::new(clock, bus, Duration::from_secs(1));
+    // Stream sources ignore poll config.
     scheduler.register(FsEventsAdapter::new());
-    scheduler.register(ProcessAdapter::new());
-    scheduler.register(NetworkAdapter::new());
-    scheduler.register(WindowAdapter::new());
-    scheduler.register(SystemAdapter::new());
     scheduler.register(EsLoggerAdapter::new());
     scheduler.register(DnsAdapter::new());
+    // Per-source cadence: expensive full-table snapshots at 1s, the cheap
+    // frontmost-app diff at 500ms, slow-moving system stats at 5s. Each may
+    // widen up to 8x its base under sustained bus-drop pressure.
+    scheduler.register_with(
+        ProcessAdapter::new(),
+        PollConfig::new(Duration::from_secs(1)),
+    );
+    scheduler.register_with(
+        NetworkAdapter::new(),
+        PollConfig::new(Duration::from_secs(1)),
+    );
+    scheduler.register_with(
+        WindowAdapter::new(),
+        PollConfig::new(Duration::from_millis(500)),
+    );
+    scheduler.register_with(
+        SystemAdapter::new(),
+        PollConfig::new(Duration::from_secs(5)),
+    );
     scheduler
 }

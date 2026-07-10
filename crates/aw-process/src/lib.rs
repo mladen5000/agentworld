@@ -15,6 +15,24 @@
 use std::sync::Arc;
 
 use aw_core::{Bus, MonotonicClock, Observation, Source, SourceAdapter, SourceBehavior};
+use serde::Serialize;
+
+/// Typed process payload. Field names are the downstream contract —
+/// `aw-events::process_lifecycle` and the process table read them by name —
+/// and must stay byte-identical to the historical `json!` keys.
+#[derive(Serialize)]
+struct ProcessPayload<'a> {
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    pgid: u32,
+    comm: &'a str,
+    name: &'a str,
+    exec_path: Option<&'a str>,
+    start_unix_secs: u64,
+    status: u32,
+    nfiles: u32,
+}
 
 pub struct ProcessAdapter;
 
@@ -89,36 +107,39 @@ mod imp {
         exec_path: Option<&str>,
         clock: &MonotonicClock,
     ) -> Observation {
-        let comm = c_array_to_string(&info.pbi_comm);
-        let name = c_array_to_string(&info.pbi_name);
-        let start_unix_secs = info.pbi_start_tvsec;
+        let comm = c_array_to_str(&info.pbi_comm);
+        let name = c_array_to_str(&info.pbi_name);
         Observation {
             timestamp: clock.now(),
             source: Source::Process,
             pid: Some(pid),
-            payload: serde_json::json!({
-                "ppid": info.pbi_ppid,
-                "uid": info.pbi_uid,
-                "gid": info.pbi_gid,
-                "pgid": info.pbi_pgid,
-                "comm": comm,
-                "name": name,
-                "exec_path": exec_path,
-                "start_unix_secs": start_unix_secs,
-                "status": info.pbi_status,
-                "nfiles": info.pbi_nfiles,
-            }),
+            payload: serde_json::to_value(super::ProcessPayload {
+                ppid: info.pbi_ppid,
+                uid: info.pbi_uid,
+                gid: info.pbi_gid,
+                pgid: info.pbi_pgid,
+                comm: &comm,
+                name: &name,
+                exec_path,
+                start_unix_secs: info.pbi_start_tvsec,
+                status: info.pbi_status,
+                nfiles: info.pbi_nfiles,
+            })
+            .expect("process payload serializes"),
             tags: None,
         }
     }
 
-    pub(super) fn c_array_to_string<const N: usize>(arr: &[std::os::raw::c_char; N]) -> String {
-        let bytes: Vec<u8> = arr
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+    /// NUL-truncate a fixed C-char array, borrowing when it is valid UTF-8
+    /// (the common case) instead of always allocating.
+    pub(super) fn c_array_to_str<const N: usize>(
+        arr: &[std::os::raw::c_char; N],
+    ) -> std::borrow::Cow<'_, str> {
+        // c_char and u8 have identical size/layout; this only reinterprets
+        // signedness.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arr.as_ptr().cast::<u8>(), N) };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(N);
+        String::from_utf8_lossy(&bytes[..end])
     }
 }
 
@@ -135,21 +156,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn c_array_to_string_truncates_at_nul() {
+    fn c_array_to_str_truncates_at_nul() {
         let mut arr: [std::os::raw::c_char; 8] = [0; 8];
         for (i, b) in b"abc".iter().enumerate() {
             arr[i] = *b as std::os::raw::c_char;
         }
-        assert_eq!(imp::c_array_to_string(&arr), "abc");
+        assert_eq!(imp::c_array_to_str(&arr), "abc");
     }
 
     #[test]
-    fn c_array_to_string_full_array_no_nul() {
+    fn c_array_to_str_full_array_no_nul() {
         let mut arr: [std::os::raw::c_char; 4] = [0; 4];
         for (i, b) in b"abcd".iter().enumerate() {
             arr[i] = *b as std::os::raw::c_char;
         }
-        assert_eq!(imp::c_array_to_string(&arr), "abcd");
+        assert_eq!(imp::c_array_to_str(&arr), "abcd");
+    }
+
+    /// The typed payload must serialize to exactly the historical key set —
+    /// downstream `aw-events` reads these by name.
+    #[test]
+    fn process_payload_keys_are_stable() {
+        let v = serde_json::to_value(ProcessPayload {
+            ppid: 1,
+            uid: 501,
+            gid: 20,
+            pgid: 2,
+            comm: "c",
+            name: "n",
+            exec_path: Some("/bin/c"),
+            start_unix_secs: 3,
+            status: 2,
+            nfiles: 4,
+        })
+        .unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "comm",
+                "exec_path",
+                "gid",
+                "name",
+                "nfiles",
+                "pgid",
+                "ppid",
+                "start_unix_secs",
+                "status",
+                "uid",
+            ]
+        );
     }
 
     #[tokio::test]

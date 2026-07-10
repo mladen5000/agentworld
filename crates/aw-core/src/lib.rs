@@ -304,7 +304,10 @@ mod tests {
         assert_eq!(proc.dropped, 3);
         assert_eq!(bus.dropped_total(), 3);
         // Other sources untouched.
-        let fs = stats.iter().find(|s| s.source == Source::FileSystem).unwrap();
+        let fs = stats
+            .iter()
+            .find(|s| s.source == Source::FileSystem)
+            .unwrap();
         assert_eq!(fs.sent, 0);
         assert_eq!(fs.dropped, 0);
     }

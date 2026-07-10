@@ -1,29 +1,50 @@
 //! Network adapter — socket snapshot (§4.3 NETWORK SOURCES, §5.2).
 //!
-//! Behavior: `Snapshot`. On each tick, runs `netstat -n -v` for tcp and udp,
-//! parses the per-socket table, and emits one `Observation` per row.
-//!
-//! Why `netstat -n -v`: it is bundled with macOS, requires no entitlements,
-//! and uniquely surfaces the owning **process:pid** for each socket — which
-//! is precisely the entity attachment Layer 1 needs (§4.2). PF/NEFilter are
-//! richer but need an extension and root.
+//! Behavior: `Snapshot`. On each tick, enumerates every TCP/UDP socket via
+//! `sysctl net.inet.{tcp,udp}.pcblist_n` in-process (see [`pcblist`]) and
+//! emits one `Observation` per socket. If the sysctl is unavailable
+//! (sandboxing, unexpected kernel), it degrades — with a single warning — to
+//! forking `netstat -n -v`, which surfaces the same rows as text.
 //!
 //! Layer 1 contract reminders enforced here:
-//! - timestamps anchored to `MonotonicClock`, not to any field in netstat output.
-//! - pid is `None` only if absent in the row (never inferred).
-//! - payload is structured (not the raw line) — flag bitfields are pass-through hex
-//!   strings; downstream layers can interpret. We do *not* decode them in Layer 1.
-//! - no aggregation, dedup, or filtering — one row in, one observation out.
+//! - timestamps anchored to `MonotonicClock`, not to any kernel field.
+//! - pid is `None` only if absent in the record (never inferred).
+//! - payload is structured (never raw text).
+//! - no aggregation, dedup, or filtering — one socket in, one observation out.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aw_core::{Bus, MonotonicClock, Observation, Source, SourceAdapter, SourceBehavior};
+use serde::Serialize;
 
-pub struct NetworkAdapter;
+mod pcblist;
+
+/// Typed socket payload. Field names are the downstream contract —
+/// `aw-events::network_lifecycle` reads them by name — and must stay
+/// byte-identical to the historical `json!` keys.
+#[derive(Serialize)]
+struct SocketPayload<'a> {
+    proto: &'a str,
+    local_addr: &'a str,
+    foreign_addr: &'a str,
+    state: Option<&'a str>,
+    rxbytes: Option<u64>,
+    txbytes: Option<u64>,
+    process_name: &'a str,
+}
+
+pub struct NetworkAdapter {
+    /// Set after the first `pcblist_n` failure; from then on every poll goes
+    /// straight to the netstat fallback.
+    native_disabled: AtomicBool,
+}
 
 impl NetworkAdapter {
     pub fn new() -> Self {
-        Self
+        Self {
+            native_disabled: AtomicBool::new(false),
+        }
     }
 }
 
@@ -43,6 +64,27 @@ impl SourceAdapter for NetworkAdapter {
     }
 
     async fn poll_snapshot(&self, clock: Arc<MonotonicClock>, bus: Bus) {
+        if !self.native_disabled.load(Ordering::Relaxed) {
+            // Raw sysctls are blocking; keep them off the async runtime.
+            match tokio::task::spawn_blocking(pcblist::snapshot).await {
+                Ok(Ok(rows)) => {
+                    for row in rows {
+                        bus.emit(socket_row_to_observation(&row, &clock));
+                    }
+                    return;
+                }
+                Ok(Err(e)) => {
+                    self.native_disabled.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        "pcblist_n sysctl unavailable ({e}); falling back to netstat for \
+                         the rest of this run"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("pcblist snapshot task failed: {e}");
+                }
+            }
+        }
         for proto in ["tcp", "udp"] {
             match run_netstat(proto).await {
                 Ok(output) => {
@@ -55,6 +97,25 @@ impl SourceAdapter for NetworkAdapter {
                 }
             }
         }
+    }
+}
+
+fn socket_row_to_observation(row: &pcblist::SocketRow, clock: &MonotonicClock) -> Observation {
+    Observation {
+        timestamp: clock.now(),
+        source: Source::Network,
+        pid: row.pid,
+        payload: serde_json::to_value(SocketPayload {
+            proto: row.proto,
+            local_addr: &row.local_addr,
+            foreign_addr: &row.foreign_addr,
+            state: row.state,
+            rxbytes: row.rxbytes,
+            txbytes: row.txbytes,
+            process_name: &row.process_name,
+        })
+        .expect("socket payload serializes"),
+        tags: None,
     }
 }
 
@@ -245,15 +306,16 @@ fn row_to_observation(row: NetstatRow<'_>, clock: &MonotonicClock) -> Observatio
         timestamp: clock.now(),
         source: Source::Network,
         pid: row.pid,
-        payload: serde_json::json!({
-            "proto": row.proto,
-            "local_addr": row.local_addr,
-            "foreign_addr": row.foreign_addr,
-            "state": row.state,
-            "rxbytes": row.rxbytes,
-            "txbytes": row.txbytes,
-            "process_name": row.process_name,
-        }),
+        payload: serde_json::to_value(SocketPayload {
+            proto: row.proto,
+            local_addr: &row.local_addr,
+            foreign_addr: &row.foreign_addr,
+            state: row.state,
+            rxbytes: row.rxbytes,
+            txbytes: row.txbytes,
+            process_name: &row.process_name,
+        })
+        .expect("socket payload serializes"),
         tags: None,
     }
 }
@@ -332,6 +394,36 @@ udp4       0      0  *.*                    *.*                                 
             "Code - Insiders"
         );
         assert_eq!(extract_process("Code - Insiders:661 00102").1, Some(661));
+    }
+
+    /// The typed payload must serialize to exactly the historical key set —
+    /// downstream `aw-events` reads these by name.
+    #[test]
+    fn socket_payload_keys_are_stable() {
+        let v = serde_json::to_value(SocketPayload {
+            proto: "tcp4",
+            local_addr: "1.2.3.4.80",
+            foreign_addr: "5.6.7.8.443",
+            state: Some("ESTABLISHED"),
+            rxbytes: Some(1),
+            txbytes: Some(2),
+            process_name: "p",
+        })
+        .unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "foreign_addr",
+                "local_addr",
+                "process_name",
+                "proto",
+                "rxbytes",
+                "state",
+                "txbytes",
+            ]
+        );
     }
 
     #[test]
