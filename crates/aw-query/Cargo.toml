@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aw-events = { workspace = true }
+aw-graph = { workspace = true }
 aw-store = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

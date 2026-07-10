@@ -12,6 +12,7 @@
 //!   aw-query domains    [--limit 20]      # top DNS names by query count
 //!   aw-query focus      [--since-mins 60] # app-focus segments
 //!   aw-query events     [--since-mins 60] [--kinds dns_query,...] [--limit 200]
+//!   aw-query topology   [--since-mins 60] [--limit 20] # degree centrality + connected components
 //!   aw-query prune      --older-than-days 30
 //!
 //! All subcommands accept `--store <path>` (default: the same
@@ -32,6 +33,7 @@ enum Subcommand {
     Domains,
     Focus,
     Events,
+    Topology,
     Prune,
 }
 
@@ -62,6 +64,7 @@ fn parse_args() -> Result<Args> {
         Some("domains") => Subcommand::Domains,
         Some("focus") => Subcommand::Focus,
         Some("events") => Subcommand::Events,
+        Some("topology") => Subcommand::Topology,
         Some("prune") => Subcommand::Prune,
         Some("-h") | Some("--help") => {
             print_usage();
@@ -142,6 +145,8 @@ fn print_usage() {
     eprintln!("  focus     [--since-mins N]    app focus segments in the last N minutes");
     eprintln!("  events    [--since-mins N] [--kinds k1,k2] [--limit N]");
     eprintln!("                                event history, oldest first (default limit 200)");
+    eprintln!("  topology  [--since-mins N] [--limit N]");
+    eprintln!("                                degree centrality + connected components (default limit 20)");
     eprintln!("  prune     --older-than-days N delete nodes/edges/events quiescent for N days");
     eprintln!();
     eprintln!("options:");
@@ -374,6 +379,43 @@ fn main() -> Result<()> {
                 }
             } else {
                 println!("{}", serde_json::to_string_pretty(&events)?);
+            }
+        }
+        Subcommand::Topology => {
+            let to = now_unix_ns();
+            let from = to.saturating_sub((args.since_mins * 60) as i64 * 1_000_000_000);
+            let g = store.graph_in_window(from, to)?;
+            let adj = aw_graph::analytics::Adjacency::from_graph(&g);
+            let degree = aw_graph::analytics::degree_centrality(&adj);
+            let mut top_by_degree: Vec<(String, u64)> = degree
+                .into_iter()
+                .map(|(node, d)| (node.label(&g), d))
+                .collect();
+            top_by_degree.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            top_by_degree.truncate(args.limit.unwrap_or(20));
+
+            let components = aw_graph::analytics::connected_components(&adj);
+            let mut sizes = aw_graph::analytics::component_sizes(&components);
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+
+            if args.pretty {
+                println!(
+                    "topology in the last {}m: {} connected components (largest: {})",
+                    args.since_mins,
+                    components.len(),
+                    sizes.first().copied().unwrap_or(0),
+                );
+                println!("top {} by degree centrality:", top_by_degree.len());
+                for (label, degree) in &top_by_degree {
+                    println!("  {label:<50} degree {degree}");
+                }
+            } else {
+                let out = serde_json::json!({
+                    "component_count": components.len(),
+                    "component_sizes": sizes,
+                    "top_by_degree": top_by_degree,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
             }
         }
         Subcommand::Prune => {

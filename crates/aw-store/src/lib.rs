@@ -2988,6 +2988,7 @@ mod tests {
 
     /// Minimal graph with one of each novelty-relevant entity, all stamped
     /// at `t_secs` (unix seconds, zero anchor — round-trip convention).
+    #[allow(clippy::too_many_arguments)]
     fn novelty_fixture(
         pid: u32,
         start: u64,
