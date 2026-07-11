@@ -40,6 +40,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aw-cli-fmt",
  "aw-core",
  "aw-events",
  "aw-graph",
@@ -66,6 +67,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aw-cli-fmt"
+version = "0.1.0"
+dependencies = [
+ "owo-colors",
 ]
 
 [[package]]
@@ -183,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aw-agents",
+ "aw-cli-fmt",
  "aw-core",
  "aw-dns",
  "aw-eslogger",
@@ -256,6 +265,7 @@ name = "aw-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aw-cli-fmt",
  "aw-events",
  "aw-graph",
  "aw-store",
@@ -1218,6 +1228,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "owo-colors"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
 name = "percent-encoding"

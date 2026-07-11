@@ -11,6 +11,7 @@ name = "aw-mvp"
 path = "src/main.rs"
 
 [dependencies]
+aw-cli-fmt = { workspace = true }
 aw-core = { workspace = true }
 aw-dns = { workspace = true }
 aw-eslogger = { workspace = true }

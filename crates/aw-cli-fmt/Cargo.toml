@@ -1,0 +1,10 @@
+[package]
+name = "aw-cli-fmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared terminal output formatting for agentworld CLI binaries: timestamps, durations, colored title bars."
+
+[dependencies]
+owo-colors = { workspace = true }

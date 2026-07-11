@@ -21,6 +21,7 @@ members = [
     "crates/aw-agents-cli",
     "crates/aw-observe",
     "crates/aw-mvp",
+    "crates/aw-cli-fmt",
 ]
 default-members = ["crates/aw-mvp"]
 
@@ -45,6 +46,7 @@ aw-graph = { path = "crates/aw-graph" }
 aw-store = { path = "crates/aw-store" }
 aw-llm = { path = "crates/aw-llm" }
 aw-agents = { path = "crates/aw-agents" }
+aw-cli-fmt = { path = "crates/aw-cli-fmt" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
@@ -55,3 +57,4 @@ anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
 libc = "0.2"
+owo-colors = "4"

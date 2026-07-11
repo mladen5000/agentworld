@@ -34,6 +34,7 @@ use aw_agents::timeline_narrator::{
     summarize_capture, NoveltySummary, ScoredSuspicion, TimelineNarrator,
 };
 use aw_agents::{AgentConfig, AgentCtx};
+use aw_cli_fmt::now_unix_ns;
 use aw_core::{Bus, MonotonicClock, Source};
 use aw_dns::DnsAdapter;
 use aw_eslogger::EsLoggerAdapter;
@@ -314,6 +315,16 @@ async fn main() -> Result<()> {
 // ============================================================================
 
 async fn run_one_shot(args: Args) -> Result<()> {
+    // Tracks whether any internal operation failed, so a scripted/cron
+    // caller can detect partial failure via exit code — previously every
+    // failure below was only `eprintln!`'d and the process always exited 0.
+    // Daemon mode deliberately does NOT use this pattern: a single tick's
+    // transient failure (e.g. one slow LLM call) must not kill an
+    // hours-long daemon: only unrecoverable startup failures there are
+    // fatal, and those already propagate via `?`.
+    let mut had_failure = false;
+
+    println!("{}", aw_cli_fmt::title_bar("capture start"));
     eprintln!(
         "aw-mvp: capturing for {}s; model={} url={}",
         args.duration.as_secs(),
@@ -348,22 +359,34 @@ async fn run_one_shot(args: Args) -> Result<()> {
                         report.edges_inserted,
                         report.edges_updated,
                     ),
-                    Err(e) => eprintln!("aw-mvp: store merge failed: {e}"),
+                    Err(e) => {
+                        eprintln!("aw-mvp: store merge failed: {e}");
+                        had_failure = true;
+                    }
                 }
                 if !events.is_empty() {
                     match store.append_events(&events) {
                         Ok(n) => eprintln!("aw-mvp: appended {n} events to history"),
-                        Err(e) => eprintln!("aw-mvp: event append failed: {e}"),
+                        Err(e) => {
+                            eprintln!("aw-mvp: event append failed: {e}");
+                            had_failure = true;
+                        }
                     }
                 }
                 opened_store = Some((store, p));
             }
-            Err(e) => eprintln!("aw-mvp: could not open store: {e}"),
+            Err(e) => {
+                eprintln!("aw-mvp: could not open store: {e}");
+                had_failure = true;
+            }
         }
     }
 
     if args.no_narrate {
         eprintln!("aw-mvp: --no-narrate — skipping narration and anomaly passes");
+        if had_failure {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -391,6 +414,7 @@ async fn run_one_shot(args: Args) -> Result<()> {
         Ok(narrative) => println!("{}", narrative.summary),
         Err(e) => {
             eprintln!("aw-mvp: narration failed (is Ollama running and the model pulled?): {e}");
+            had_failure = true;
             if !flags_fallback.is_empty() {
                 println!("[narration unavailable] anomaly flags this capture:");
                 for f in &flags_fallback {
@@ -408,10 +432,17 @@ async fn run_one_shot(args: Args) -> Result<()> {
     match ProcessAnomalyDetector::new(make_ctx()).run(&graph).await {
         Ok(report) => {
             println!();
-            println!("--- anomaly check ---");
+            println!("{}", aw_cli_fmt::section("anomaly check"));
             println!("{}", report.summary);
         }
-        Err(e) => eprintln!("aw-mvp: anomaly pass failed: {e}"),
+        Err(e) => {
+            eprintln!("aw-mvp: anomaly pass failed: {e}");
+            had_failure = true;
+        }
+    }
+
+    if had_failure {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -433,9 +464,13 @@ const TOPOLOGY_TOP_N: usize = 10;
 fn print_topology_summary(graph: &aw_graph::Graph) {
     let adj = analytics::Adjacency::from_graph(graph);
     let degree = analytics::degree_centrality(&adj);
-    let mut top_by_degree: Vec<(String, u64)> = degree
+    let weighted_degree = analytics::weighted_degree_centrality(&adj);
+    let mut top_by_degree: Vec<(String, u64, u64)> = degree
         .into_iter()
-        .map(|(node, d)| (node.label(graph), d))
+        .map(|(node, d)| {
+            let w = weighted_degree.get(&node).copied().unwrap_or(0);
+            (node.label(graph), d, w)
+        })
         .collect();
     top_by_degree.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     top_by_degree.truncate(TOPOLOGY_TOP_N);
@@ -444,15 +479,16 @@ fn print_topology_summary(graph: &aw_graph::Graph) {
     let mut sizes = analytics::component_sizes(&components);
     sizes.sort_unstable_by(|a, b| b.cmp(a));
 
-    println!("--- topology ---");
+    println!("{}", aw_cli_fmt::section("topology"));
     println!(
         "{} connected components (largest: {})",
         components.len(),
         sizes.first().copied().unwrap_or(0),
     );
     println!("top {} by degree centrality:", top_by_degree.len());
-    for (label, degree) in &top_by_degree {
-        println!("  {label:<50} degree {degree}");
+    println!("  (weighted = re-observation count on queried_domain edges only — secondary signal)");
+    for (label, degree, weighted) in &top_by_degree {
+        println!("  {label:<50} degree {degree:>4}  weighted {weighted:>6}");
     }
     println!();
 }
@@ -694,14 +730,6 @@ fn merge_scored_suspicions(
     summary.scored_suspicions = scored;
 }
 
-/// Wall-clock now in unix nanoseconds — the encoding the store uses.
-fn now_unix_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
 // ============================================================================
 // Daemon
 // ============================================================================
@@ -817,6 +845,7 @@ async fn run_daemon(args: Args) -> Result<()> {
         0 => 30,
         d => d.min(30) as u32,
     };
+    let mut tick_count: u64 = 0;
 
     loop {
         tokio::select! {
@@ -826,6 +855,9 @@ async fn run_daemon(args: Args) -> Result<()> {
                 break;
             }
             _ = ticker.tick() => {
+                tick_count += 1;
+                println!("{}", aw_cli_fmt::title_bar(&format!("tick {tick_count}")));
+
                 // Reap a previous narration if it already finished; if it's
                 // still going, skip this tick rather than queue another call.
                 if let Some(h) = &narrating {

@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
+use aw_cli_fmt::fmt_duration;
 #[cfg(test)]
 use aw_events::SCHEMA_VERSION;
 use aw_events::{Event, EventKind};
@@ -1027,7 +1028,7 @@ fn event_suspicions(events: &[Event]) -> Vec<String> {
 
 fn render_prompt(s: &CaptureSummary, live: bool) -> String {
     let mut out = String::new();
-    let dur_human = humanize_duration(s.duration_secs);
+    let dur_human = fmt_duration(s.duration_secs);
     if live {
         out.push_str(&format!(
             "Live window: the last {dur_human} of macOS activity ({n} events). \
@@ -1121,7 +1122,7 @@ fn render_prompt(s: &CaptureSummary, live: bool) -> String {
     if !s.focus_segments.is_empty() {
         out.push_str("APP FOCUS (in order):\n");
         for seg in &s.focus_segments {
-            let dur = humanize_duration(seg.duration_secs);
+            let dur = fmt_duration(seg.duration_secs);
             let bundle = seg
                 .bundle_id
                 .as_deref()
@@ -1206,29 +1207,6 @@ fn render_prompt(s: &CaptureSummary, live: bool) -> String {
     out
 }
 
-fn humanize_duration(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let m = secs / 60;
-    let s = secs % 60;
-    if m < 60 {
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m{s}s")
-        }
-    } else {
-        let h = m / 60;
-        let mm = m % 60;
-        if mm == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h{mm}m")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1251,16 +1229,6 @@ mod tests {
             pid,
             payload,
         }
-    }
-
-    #[test]
-    fn humanize_duration_renders_seconds_minutes_hours() {
-        assert_eq!(humanize_duration(0), "0s");
-        assert_eq!(humanize_duration(45), "45s");
-        assert_eq!(humanize_duration(60), "1m");
-        assert_eq!(humanize_duration(125), "2m5s");
-        assert_eq!(humanize_duration(3600), "1h");
-        assert_eq!(humanize_duration(3725), "1h2m");
     }
 
     #[test]

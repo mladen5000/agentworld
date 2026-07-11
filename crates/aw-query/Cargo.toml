@@ -11,6 +11,7 @@ name = "aw-query"
 path = "src/main.rs"
 
 [dependencies]
+aw-cli-fmt = { workspace = true }
 aw-events = { workspace = true }
 aw-graph = { workspace = true }
 aw-store = { workspace = true }
